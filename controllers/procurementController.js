@@ -42,21 +42,45 @@ exports.updateRequest = async (req, res) => {
     try {
         const fields = req.body;
         const sets = [], values = [];
+        
+        const mapping = {
+            item_name: 'item_name',
+            items: 'items',
+            category: 'category',
+            quantity: 'quantity',
+            estimated_cost: 'estimated_cost',
+            total: 'estimated_cost',
+            requester: 'requester',
+            priority: 'priority',
+            notes: 'notes',
+            status: 'status',
+            department: 'department'
+        };
+
         for (const [k, v] of Object.entries(fields)) {
-            if (['id', 'created_at', 'company_id'].includes(k)) continue;
-            sets.push(`${k} = ?`); 
-            values.push(k === 'items' ? JSON.stringify(v) : v);
+            const dbField = mapping[k];
+            if (!dbField) continue;
+            
+            sets.push(`${dbField} = ?`); 
+            values.push(dbField === 'items' ? JSON.stringify(v) : v);
         }
+
+        if (sets.length === 0) return successResponse(res, null, 'No valid fields to update.');
+
         const cs = companyScope(req);
         values.push(req.params.id, ...cs.params);
         await db.query(`UPDATE purchase_requests SET ${sets.join(', ')} WHERE id = ?${cs.clause}`, values);
+        
         const status = req.body.status;
         if (status) {
             await createNotification({ companyId: req.companyScope, roleTarget: 'procurement', type: 'order', title: `Purchase Request ${status}`, message: `PR #${req.params.id} status → ${status}`, link: '/dashboard/purchase-requests' });
             await createNotification({ companyId: req.companyScope, roleTarget: 'admin', type: 'order', title: `Purchase Request ${status}`, message: `PR #${req.params.id} updated to ${status}`, link: '/dashboard/purchase-requests' });
         }
         return successResponse(res, { id: req.params.id }, 'Request updated.');
-    } catch (err) { return errorResponse(res, 'Failed to update request.', 500); }
+    } catch (err) { 
+        console.error('Update request error:', err);
+        return errorResponse(res, 'Failed to update request.', 500); 
+    }
 };
 
 exports.deleteRequest = async (req, res) => {
