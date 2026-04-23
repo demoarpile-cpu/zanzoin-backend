@@ -70,10 +70,15 @@ const migrations = [
             await addColumnIfMissing('purchase_requests', 'priority', "ENUM('Low','Normal','High','Urgent') DEFAULT 'Normal'", 'requester_id');
             await addColumnIfMissing('purchase_requests', 'notes', 'TEXT', 'priority');
             await addColumnIfMissing('purchase_requests', 'estimated_cost', 'DECIMAL(12,2) DEFAULT 0.00', 'quantity');
-            await addColumnIfMissing('purchase_requests', 'department', 'VARCHAR(255)', 'notes');
             
             // Also ensure item_name and quantity allow NULL since we use JSON items now
             await db.query("ALTER TABLE purchase_requests MODIFY COLUMN item_name VARCHAR(255) NULL, MODIFY COLUMN quantity INT NULL");
+        }
+    },
+    {
+        name: '006_add_department_to_purchase_requests',
+        up: async () => {
+            await addColumnIfMissing('purchase_requests', 'department', 'VARCHAR(255)', 'notes');
         }
     }
 ];
