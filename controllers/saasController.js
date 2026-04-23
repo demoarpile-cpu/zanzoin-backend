@@ -101,14 +101,13 @@ exports.provisionClient = async (req, res) => {
         await db.query(`UPDATE saas_requests SET status = 'Provisioned', payment_status = 'Paid', company_id = ? WHERE id = ?`, [companyId, id]);
 
         // Try to send credentials email
-        try {
-            await sendMail(request.email, 'Welcome to ZaneZion',
-                `<h2>Your ZaneZion account is ready!</h2>
-                 <p>Email: <strong>${request.email}</strong></p>
-                 <p>Password: <strong>${password}</strong></p>
-                 <p>Plan: <strong>${request.plan}</strong></p>`
-            );
-        } catch (e) { console.log('Email skipped'); }
+        // Fire and forget email
+        sendMail(request.email, 'Welcome to ZaneZion',
+            `<h2>Your ZaneZion account is ready!</h2>
+                <p>Email: <strong>${request.email}</strong></p>
+                <p>Password: <strong>${password}</strong></p>
+                <p>Plan: <strong>${request.plan}</strong></p>`
+        ).catch(e => console.log('SaaS Welcome email failed:', e.message));
 
         return successResponse(res, {
             clientId: companyId,

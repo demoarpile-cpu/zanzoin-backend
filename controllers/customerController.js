@@ -3,6 +3,7 @@ const db = require('../config/db');
 const { companyFilter, companyScope } = require('../middleware/company');
 const { generatePassword, successResponse, errorResponse } = require('../utils/helpers');
 const { createNotification } = require('./notificationController');
+const { sendMail } = require('../utils/mailer');
 
 // GET /api/customers (aliased as /api/clients)
 exports.getAll = async (req, res) => {
@@ -127,16 +128,13 @@ exports.create = async (req, res) => {
                         [newCompanyId, name, email, hashedPassword, phone || null, userRole]
                     );
 
-                    // Try to send welcome email
-                    try {
-                        const { sendMail } = require('../utils/mailer');
-                        await sendMail(email, 'Welcome to ZaneZion',
-                            `<h2>Your ZaneZion ${userRole === 'customer' ? 'Personal' : 'Institutional'} account is ready!</h2>
-                             <p>Email: <strong>${email}</strong></p>
-                             <p>Password: <strong>${userPassword}</strong></p>
-                             <p>Type: <strong>${normalizedClientType}</strong></p>`
-                        );
-                    } catch (e) { console.log('Welcome email skipped'); }
+                    // Fire and forget email - don't await to prevent API hanging
+                    sendMail(email, 'Welcome to ZaneZion',
+                        `<h2>Your ZaneZion ${userRole === 'customer' ? 'Personal' : 'Institutional'} account is ready!</h2>
+                         <p>Email: <strong>${email}</strong></p>
+                         <p>Password: <strong>${userPassword}</strong></p>
+                         <p>Type: <strong>${normalizedClientType}</strong></p>`
+                    ).catch(e => console.log('Welcome email failed:', e.message));
 
                     credentials = { email, password: userPassword, message: `Login credentials generated and sent to ${email}` };
                 }
@@ -181,15 +179,12 @@ exports.create = async (req, res) => {
                     [companyId, name, email, hashedPassword, phone || null]
                 );
 
-                // Send welcome email
-                try {
-                    const { sendMail } = require('../utils/mailer');
-                    await sendMail(email, 'Your Account Credentials', 
-                        `<h2>Your ZaneZion customer account is ready!</h2>
-                         <p>Email: <strong>${email}</strong></p>
-                         <p>Password: <strong>${userPassword}</strong></p>`
-                    );
-                } catch (e) { console.log('Customer email skipped'); }
+                // Fire and forget email
+                sendMail(email, 'Your Account Credentials', 
+                    `<h2>Your ZaneZion customer account is ready!</h2>
+                     <p>Email: <strong>${email}</strong></p>
+                     <p>Password: <strong>${userPassword}</strong></p>`
+                ).catch(e => console.log('Customer email failed:', e.message));
 
                 credentials = { email, password: userPassword, message: `Login credentials generated and sent to ${email}` };
             }

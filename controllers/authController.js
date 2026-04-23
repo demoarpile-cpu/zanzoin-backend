@@ -206,12 +206,9 @@ exports.forgotPassword = async (req, res) => {
             [email, otp, expiresAt]
         );
 
-        // Try to send email
-        try {
-            await sendMail(email, 'ZaneZion Password Reset', `<h2>Your verification code: <strong>${otp}</strong></h2><p>This code expires in 15 minutes.</p>`);
-        } catch (e) {
-            console.log('Email send failed, OTP returned in response for dev.');
-        }
+        // Fire and forget email
+        sendMail(email, 'ZaneZion Password Reset', `<h2>Your verification code: <strong>${otp}</strong></h2><p>This code expires in 15 minutes.</p>`)
+            .catch(e => console.log('Password reset email failed:', e.message));
 
         return successResponse(res, { otp }, 'OTP sent to email.');
     } catch (err) {
