@@ -6,13 +6,14 @@ const { createNotification } = require('./notificationController');
 // --- ASSIGNMENTS ---
 exports.getAssignments = async (req, res) => {
     try {
-        const cf = companyFilter(req);
-        const role = req.user.role;
+        const cf = companyFilter(req, 'sa');
+        const role = req.user.role?.toLowerCase();
         let extra = '';
         const extraParams = [];
 
-        if (role === 'staff') {
-            extra = ' AND assignee_id = ?';
+        // Allow 'staff' or 'field staff' to see only their assignments
+        if (role === 'staff' || role === 'field staff') {
+            extra = ' AND sa.assignee_id = ?';
             extraParams.push(req.user.id);
         }
 
@@ -20,8 +21,24 @@ exports.getAssignments = async (req, res) => {
             `SELECT sa.*, u.name as assignee_name FROM staff_assignments sa LEFT JOIN users u ON sa.assignee_id = u.id WHERE 1=1 ${cf.clause} ${extra} ORDER BY sa.created_at DESC`,
             [...cf.params, ...extraParams]
         );
-        return successResponse(res, rows);
-    } catch (err) { return errorResponse(res, 'Failed to fetch assignments.', 500); }
+
+        const mapped = rows.map(r => ({
+            ...r,
+            assigneeId: r.assignee_id,
+            missionType: r.mission_type,
+            passengerName: r.passenger_name,
+            pickupTime: r.pickup_time,
+            dropLocation: r.drop_location,
+            pickupLocation: r.pickup_location,
+            deliveryLocation: r.delivery_location,
+            goodsDetails: r.goods_details
+        }));
+
+        return successResponse(res, mapped);
+    } catch (err) { 
+        console.error("Get Assignments Error:", err);
+        return errorResponse(res, 'Failed to fetch assignments.', 500); 
+    }
 };
 
 exports.createAssignment = async (req, res) => {
@@ -110,12 +127,12 @@ exports.toggleAvailability = async (req, res) => {
 // --- LEAVE REQUESTS ---
 exports.getLeaveRequests = async (req, res) => {
     try {
-        const cf = companyFilter(req);
-        const role = req.user.role;
+        const cf = companyFilter(req, 'lr');
+        const role = req.user.role?.toLowerCase();
         let extra = '';
         const extraParams = [];
 
-        if (role === 'staff') {
+        if (role === 'staff' || role === 'field staff') {
             extra = ' AND lr.user_id = ?';
             extraParams.push(req.user.id);
         }
@@ -124,8 +141,20 @@ exports.getLeaveRequests = async (req, res) => {
             `SELECT lr.*, u.name as user_name FROM leave_requests lr LEFT JOIN users u ON lr.user_id = u.id WHERE 1=1 ${cf.clause} ${extra} ORDER BY lr.created_at DESC`,
             [...cf.params, ...extraParams]
         );
-        return successResponse(res, rows);
-    } catch (err) { return errorResponse(res, 'Failed to fetch leave requests.', 500); }
+
+        const mapped = rows.map(r => ({
+            ...r,
+            userId: r.user_id,
+            leaveType: r.leave_type,
+            startDate: r.start_date,
+            endDate: r.end_date
+        }));
+
+        return successResponse(res, mapped);
+    } catch (err) { 
+        console.error("Get Leave Error:", err);
+        return errorResponse(res, 'Failed to fetch leave requests.', 500); 
+    }
 };
 
 exports.createLeaveRequest = async (req, res) => {
