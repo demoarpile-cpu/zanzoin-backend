@@ -18,12 +18,19 @@ exports.createRequest = async (req, res) => {
         const companyId = req.companyScope;
         const requesterId = req.user.id;
 
+        let finalItemName = item_name;
+        let finalQuantity = quantity;
+        if (items && Array.isArray(items) && items.length > 0) {
+            if (!finalItemName) finalItemName = items[0].name;
+            if (!finalQuantity) finalQuantity = items[0].qty;
+        }
+
         const [result] = await db.query(
             `INSERT INTO purchase_requests (company_id, item_name, items, category, quantity, estimated_cost, requester, requester_id, priority, notes, department) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [companyId, item_name || null, JSON.stringify(items || []), category || null, quantity || null, estimated_cost || 0, requester || req.user.name, requesterId, priority || 'Normal', notes || null, department || null]
+            [companyId, finalItemName || null, JSON.stringify(items || []), category || null, finalQuantity || null, estimated_cost || 0, requester || req.user.name, requesterId, priority || 'Normal', notes || null, department || null]
         );
-        await createNotification({ companyId, roleTarget: 'procurement', type: 'order', title: 'New Purchase Request', message: `PR #${result.insertId} — "${item_name}" by ${req.user.name || 'Staff'}`, link: '/dashboard/purchase-requests' });
-        await createNotification({ companyId, roleTarget: 'admin', type: 'order', title: 'New Purchase Request', message: `PR #${result.insertId} — "${item_name}"`, link: '/dashboard/purchase-requests' });
+        await createNotification({ companyId, roleTarget: 'procurement', type: 'order', title: 'New Purchase Request', message: `PR #${result.insertId} — "${finalItemName}" by ${req.user.name || 'Staff'}`, link: '/dashboard/purchase-requests' });
+        await createNotification({ companyId, roleTarget: 'admin', type: 'order', title: 'New Purchase Request', message: `PR #${result.insertId} — "${finalItemName}"`, link: '/dashboard/purchase-requests' });
         return successResponse(res, { id: result.insertId }, 'Purchase request created.', 201);
     } catch (err) { 
         console.error('Create request error:', err);
