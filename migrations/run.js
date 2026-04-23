@@ -61,6 +61,19 @@ const migrations = [
             `);
             console.log('  ✅ Updated "orders" status/stage enums');
         }
+    },
+    {
+        name: '005_fix_purchase_requests_columns',
+        up: async () => {
+            await addColumnIfMissing('purchase_requests', 'items', 'JSON', 'item_name');
+            await addColumnIfMissing('purchase_requests', 'requester_id', 'INT', 'requester');
+            await addColumnIfMissing('purchase_requests', 'priority', "ENUM('Low','Normal','High','Urgent') DEFAULT 'Normal'", 'requester_id');
+            await addColumnIfMissing('purchase_requests', 'notes', 'TEXT', 'priority');
+            await addColumnIfMissing('purchase_requests', 'estimated_cost', 'DECIMAL(12,2) DEFAULT 0.00', 'quantity');
+            
+            // Also ensure item_name and quantity allow NULL since we use JSON items now
+            await db.query("ALTER TABLE purchase_requests MODIFY COLUMN item_name VARCHAR(255) NULL, MODIFY COLUMN quantity INT NULL");
+        }
     }
 ];
 
