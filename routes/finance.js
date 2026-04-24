@@ -12,6 +12,12 @@ router.post('/invoices', requireRole('super_admin', 'admin', 'operation'), ctrl.
 router.put('/invoices/:id', requireRole('super_admin', 'admin'), ctrl.updateInvoice);
 router.delete('/invoices/:id', requireRole('super_admin', 'admin'), ctrl.deleteInvoice);
 router.post('/invoices/:id/pay', ctrl.payInvoice);
+
+// Payroll
+router.get('/payroll', requireRole('super_admin', 'admin'), ctrl.getAllPayroll);
+router.post('/payroll', requireRole('super_admin', 'admin'), ctrl.createPayroll);
+router.put('/payroll/:id', requireRole('super_admin', 'admin'), ctrl.updatePayroll);
+router.delete('/payroll/:id', requireRole('super_admin', 'admin'), ctrl.deletePayroll);
 router.get('/my-payroll', ctrl.getMyPayroll);
 
 module.exports = router;

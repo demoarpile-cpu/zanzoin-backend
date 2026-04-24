@@ -134,9 +134,115 @@ exports.getMyPayroll = async (req, res) => {
     try {
         const userId = req.user.id;
         const [rows] = await db.query(
-            `SELECT p.*, u.name as user_name FROM payroll p LEFT JOIN users u ON p.user_id = u.id WHERE p.user_id = ? ORDER BY p.payment_date DESC`,
+            `SELECT p.*, p.net_amount as amount, u.name as user_name FROM payroll p LEFT JOIN users u ON p.user_id = u.id WHERE p.user_id = ? ORDER BY p.payment_date DESC`,
             [userId]
         );
         return successResponse(res, rows);
     } catch (err) { return errorResponse(res, 'Failed to fetch payroll.', 500); }
+};
+
+// --- ADMIN PAYROLL MANAGEMENT ---
+
+// GET /api/finance/payroll
+exports.getAllPayroll = async (req, res) => {
+    try {
+        const cf = companyFilter(req, 'p');
+        const [rows] = await db.query(
+            `SELECT p.*, p.net_amount as amount, u.name as user_name FROM payroll p 
+             LEFT JOIN users u ON p.user_id = u.id 
+             WHERE 1=1 ${cf.clause} 
+             ORDER BY p.payment_date DESC`,
+            cf.params
+        );
+        return successResponse(res, rows);
+    } catch (err) {
+        console.error('Fetch payroll error:', err);
+        return errorResponse(res, 'Failed to fetch payroll records.', 500);
+    }
+};
+
+// POST /api/finance/payroll
+exports.createPayroll = async (req, res) => {
+    try {
+        const { 
+            user_id, base_salary, bonus, nib_deduction, medical_deduction, 
+            pension_deduction, savings_deduction, birthday_club, 
+            net_amount, method, payment_date, status 
+        } = req.body;
+        
+        const companyId = req.companyScope;
+
+        const [result] = await db.query(
+            `INSERT INTO payroll (
+                company_id, user_id, base_salary, bonus, nib_deduction, 
+                medical_deduction, pension_deduction, savings_deduction, 
+                birthday_club, net_amount, method, payment_date, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                companyId, user_id, base_salary || 0, bonus || 0, nib_deduction || 0, 
+                medical_deduction || 0, pension_deduction || 0, savings_deduction || 0, 
+                birthday_club || 0, net_amount || 0, method || 'Direct Deposit', 
+                payment_date || null, status || 'pending'
+            ]
+        );
+
+        await createNotification({
+            companyId,
+            roleTarget: 'admin',
+            type: 'alert',
+            title: 'Payroll Disbursed',
+            message: `New settlement record created for user #${user_id} — $${net_amount}`,
+            link: '/dashboard/payroll'
+        });
+
+        return successResponse(res, { id: result.insertId }, 'Payroll record created.', 201);
+    } catch (err) {
+        console.error('Create payroll error:', err);
+        return errorResponse(res, 'Failed to create payroll record.', 500);
+    }
+};
+
+// PUT /api/finance/payroll/:id
+exports.updatePayroll = async (req, res) => {
+    try {
+        const fields = req.body;
+        const sets = [], values = [];
+        
+        const allowedFields = [
+            'base_salary', 'bonus', 'nib_deduction', 'medical_deduction', 
+            'pension_deduction', 'savings_deduction', 'birthday_club', 
+            'net_amount', 'method', 'payment_date', 'status'
+        ];
+
+        for (const [k, v] of Object.entries(fields)) {
+            if (allowedFields.includes(k)) {
+                sets.push(`${k} = ?`);
+                values.push(v);
+            }
+        }
+
+        if (sets.length === 0) return errorResponse(res, 'No valid fields to update.', 400);
+
+        const cs = companyScope(req);
+        values.push(req.params.id, ...cs.params);
+        
+        await db.query(`UPDATE payroll SET ${sets.join(', ')} WHERE id = ?${cs.clause}`, values);
+        
+        return successResponse(res, { id: req.params.id }, 'Payroll record updated.');
+    } catch (err) {
+        console.error('Update payroll error:', err);
+        return errorResponse(res, 'Failed to update payroll record.', 500);
+    }
+};
+
+// DELETE /api/finance/payroll/:id
+exports.deletePayroll = async (req, res) => {
+    try {
+        const cs = companyScope(req);
+        await db.query(`DELETE FROM payroll WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
+        return successResponse(res, null, 'Payroll record deleted.');
+    } catch (err) {
+        console.error('Delete payroll error:', err);
+        return errorResponse(res, 'Failed to delete payroll record.', 500);
+    }
 };

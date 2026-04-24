@@ -53,10 +53,35 @@ exports.login = async (req, res) => {
         const menuMap = {};
         SYSTEM_MENUS.forEach(m => { menuMap[m.name] = m; });
 
-        const [rawPerms] = await db.query(
+        let [rawPerms] = await db.query(
             'SELECT * FROM menu_permissions WHERE role = ? AND (company_id = ? OR company_id IS NULL)',
             [user.role, user.company_id]
         );
+
+        // Field staff: effective rights = this user's staff row ∩ same company's admin row (per menu).
+        // Admin ne jo module allow nahi kiya, staff ko wo kabhi open nahi hoga.
+        if (String(user.role || '').toLowerCase() === 'staff' && user.company_id) {
+            const [adminPerms] = await db.query(
+                'SELECT menu_name, can_view, can_create, can_edit, can_delete FROM menu_permissions WHERE role = ? AND company_id = ?',
+                ['admin', user.company_id]
+            );
+            if (adminPerms.length > 0) {
+                const adminByMenu = new Map(adminPerms.map((r) => [r.menu_name, r]));
+                rawPerms = rawPerms.map((p) => {
+                    const a = adminByMenu.get(p.menu_name);
+                    if (!a) {
+                        return { ...p, can_view: 0, can_create: 0, can_edit: 0, can_delete: 0 };
+                    }
+                    return {
+                        ...p,
+                        can_view: p.can_view && a.can_view ? 1 : 0,
+                        can_create: p.can_create && a.can_create ? 1 : 0,
+                        can_edit: p.can_edit && a.can_edit ? 1 : 0,
+                        can_delete: p.can_delete && a.can_delete ? 1 : 0,
+                    };
+                });
+            }
+        }
 
         // Enrich DB permissions with path, icon, name so frontend sidebar can render them
         const menuPermissions = rawPerms.map(p => {
