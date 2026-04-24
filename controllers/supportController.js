@@ -14,11 +14,11 @@ exports.getTickets = async (req, res) => {
 
 exports.createTicket = async (req, res) => {
     try {
-        const { subject, description, priority } = req.body;
+        const { subject, description, priority, category, messages } = req.body;
         const companyId = req.companyScope;
         const [result] = await db.query(
-            `INSERT INTO support_tickets (company_id, subject, description, priority, submitted_by) VALUES (?, ?, ?, ?, ?)`,
-            [companyId, subject, description || null, priority || 'medium', req.user.id]
+            `INSERT INTO support_tickets (company_id, subject, category, description, messages, priority, submitted_by) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [companyId, subject, category || 'General', description || null, messages ? JSON.stringify(messages) : null, priority || 'medium', req.user.id]
         );
         // Notify admin about new support ticket
         await createNotification({
@@ -31,16 +31,28 @@ exports.createTicket = async (req, res) => {
         });
 
         return successResponse(res, { id: result.insertId }, 'Ticket created.', 201);
-    } catch (err) { return errorResponse(res, 'Failed to create ticket.', 500); }
+    } catch (err) { 
+        console.error('Create ticket error:', err);
+        return errorResponse(res, 'Failed to create ticket.', 500); 
+    }
 };
 
 exports.updateTicketStatus = async (req, res) => {
     try {
-        const { status } = req.body;
+        const { status, messages } = req.body;
         const cs = companyScope(req);
-        await db.query(`UPDATE support_tickets SET status = ? WHERE id = ?${cs.clause}`, [status, req.params.id, ...cs.params]);
+        
+        if (messages) {
+            await db.query(`UPDATE support_tickets SET status = COALESCE(?, status), messages = ? WHERE id = ?${cs.clause}`, [status, JSON.stringify(messages), req.params.id, ...cs.params]);
+        } else {
+            await db.query(`UPDATE support_tickets SET status = ? WHERE id = ?${cs.clause}`, [status, req.params.id, ...cs.params]);
+        }
+        
         return successResponse(res, { id: req.params.id, status }, 'Ticket updated.');
-    } catch (err) { return errorResponse(res, 'Failed to update ticket.', 500); }
+    } catch (err) { 
+        console.error('Update ticket error:', err);
+        return errorResponse(res, 'Failed to update ticket.', 500); 
+    }
 };
 
 // --- EVENTS ---
