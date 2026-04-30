@@ -2,6 +2,14 @@ const db = require('../config/db');
 const { companyFilter, companyScope } = require('../middleware/company');
 const { successResponse, errorResponse } = require('../utils/helpers');
 
+/** UI sends 0–100 (percent); DB stores DECIMAL(5,2). */
+function clampPercentMetric(val) {
+    if (val === null || val === undefined || val === '') return 0;
+    const n = Number(val);
+    if (!Number.isFinite(n)) return 0;
+    return Math.min(100, Math.max(0, n));
+}
+
 // GET /api/vendors
 exports.getAll = async (req, res) => {
     try {
@@ -17,14 +25,17 @@ exports.getAll = async (req, res) => {
 // POST /api/vendors
 exports.create = async (req, res) => {
     try {
-        const { name, email, phone, contact_name, contact, category, rating } = req.body;
+        const { name, email, phone, contact_name, contact, category, rating, delivery } = req.body;
         // Accept both 'address' and 'location' from frontend
         const location = req.body.location || req.body.address || null;
         const companyId = req.body.company_id || req.companyScope;
 
+        const ratingVal = clampPercentMetric(rating);
+        const deliveryVal = clampPercentMetric(delivery);
+
         const [result] = await db.query(
-            `INSERT INTO vendors (company_id, name, email, phone, contact_name, category, location, rating)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO vendors (company_id, name, email, phone, contact_name, category, location, rating, delivery)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 companyId,
                 name,
@@ -33,7 +44,8 @@ exports.create = async (req, res) => {
                 contact_name || contact || null,
                 category || null,
                 location,
-                rating || 0
+                ratingVal,
+                deliveryVal
             ]
         );
         return successResponse(res, { id: result.insertId, name }, 'Vendor created.', 201);
@@ -47,7 +59,7 @@ exports.create = async (req, res) => {
 exports.update = async (req, res) => {
     try {
         // Only update valid DB columns — reject frontend-only fields
-        const allowed = ['name', 'email', 'phone', 'contact_name', 'category', 'location', 'rating', 'status'];
+        const allowed = ['name', 'email', 'phone', 'contact_name', 'category', 'location', 'rating', 'delivery', 'status'];
         const sets = [];
         const values = [];
 
@@ -59,8 +71,12 @@ exports.update = async (req, res) => {
 
         for (const [key, val] of Object.entries(body)) {
             if (!allowed.includes(key)) continue;
+            let v = val === '' ? null : val;
+            if ((key === 'rating' || key === 'delivery') && v != null) {
+                v = clampPercentMetric(v);
+            }
             sets.push(`${key} = ?`);
-            values.push(val === '' ? null : val);
+            values.push(v);
         }
 
         if (sets.length === 0) return errorResponse(res, 'No valid fields to update.', 400);

@@ -138,6 +138,18 @@ const migrations = [
             `);
             console.log('  ✅ Multi-tenant upgrade complete');
         }
+    },
+    {
+        name: '009_widen_vendors_rating_delivery',
+        up: async () => {
+            // rating was DECIMAL(3,2) → max 9.99; frontend sends 0–100 (%).
+            await db.query(`
+                ALTER TABLE vendors
+                MODIFY COLUMN rating DECIMAL(5,2) NOT NULL DEFAULT 0.00
+            `);
+            await addColumnIfMissing('vendors', 'delivery', 'DECIMAL(5,2) NOT NULL DEFAULT 0.00', 'rating');
+            console.log('  ✅ vendors.rating widened to DECIMAL(5,2); vendors.delivery column ensured');
+        }
     }
 ];
 
