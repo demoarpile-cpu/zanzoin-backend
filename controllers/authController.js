@@ -29,9 +29,17 @@ exports.login = async (req, res) => {
 
         const user = users[0];
 
-        // Check user status
+        // Check user status (and auto-sync when company already approved)
+        // Some approval flows activate company/request but leave user.status as pending.
+        // In that case, auto-promote user to active so approved SaaS/business accounts can log in.
         if (user.status === 'pending') {
-            return errorResponse(res, 'Account pending approval.', 403);
+            const companyApproved = String(user.company_status || '').toLowerCase() === 'active';
+            if (companyApproved && user.company_id) {
+                await db.query('UPDATE users SET status = ? WHERE id = ?', ['active', user.id]);
+                user.status = 'active';
+            } else {
+                return errorResponse(res, 'Account pending approval.', 403);
+            }
         }
         if (user.status === 'rejected') {
             return errorResponse(res, 'Account has been rejected.', 403);
