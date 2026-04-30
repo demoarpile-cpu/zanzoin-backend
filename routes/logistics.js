@@ -29,4 +29,16 @@ router.delete('/routes/:id', requireRole('super_admin', 'admin', 'logistics'), c
 router.get('/pricing', ctrl.getPricing);
 router.put('/pricing/:id', requireRole('super_admin', 'admin'), ctrl.updatePricing);
 
+// Tracking
+router.get('/tracking', ctrl.getTracking);
+router.post('/tracking', requireRole('super_admin', 'admin', 'logistics'), ctrl.createTracking);
+router.put('/tracking/:id', requireRole('super_admin', 'admin', 'logistics'), ctrl.updateTracking);
+router.delete('/tracking/:id', requireRole('super_admin', 'admin', 'logistics'), ctrl.deleteTracking);
+
+// Urgent
+router.get('/urgent', ctrl.getUrgentTasks);
+router.post('/urgent', requireRole('super_admin', 'admin', 'logistics'), ctrl.createUrgentTask);
+router.put('/urgent/:id', requireRole('super_admin', 'admin', 'logistics'), ctrl.updateUrgentTask);
+router.delete('/urgent/:id', requireRole('super_admin', 'admin', 'logistics'), ctrl.deleteUrgentTask);
+
 module.exports = router;

@@ -11,9 +11,9 @@ router.get('/plans', ctrl.getPlans);
 
 // Protected routes
 router.use(verifyToken, scopeByCompany);
-router.post('/plans', requireRole('super_admin'), ctrl.createPlan);
-router.put('/plans/:id', requireRole('super_admin'), ctrl.updatePlan);
-router.delete('/plans/:id', requireRole('super_admin'), ctrl.deletePlan);
+router.post('/plans', requireRole('super_admin', 'admin'), ctrl.createPlan);
+router.put('/plans/:id', requireRole('super_admin', 'admin'), ctrl.updatePlan);
+router.delete('/plans/:id', requireRole('super_admin', 'admin'), ctrl.deletePlan);
 
 // Requests
 router.get('/requests', ctrl.getRequests);

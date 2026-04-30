@@ -159,7 +159,24 @@ exports.getLeaveRequests = async (req, res) => {
 
 exports.createLeaveRequest = async (req, res) => {
     try {
-        const { leave_type, start_date, end_date, reason } = req.body;
+        const rawLeaveType = req.body.leave_type || req.body.leaveType || req.body.type || '';
+        const leaveTypeMap = {
+            vacation: 'vacation',
+            sick: 'sick',
+            personal: 'personal',
+            bereavement: 'bereavement'
+        };
+        const leave_type = leaveTypeMap[String(rawLeaveType).trim().toLowerCase()];
+        const start_date = req.body.start_date || req.body.startDate;
+        const end_date = req.body.end_date || req.body.endDate;
+        const reason = req.body.reason;
+
+        if (!leave_type) {
+            return errorResponse(res, 'Invalid leave type. Use vacation, sick, personal, or bereavement.', 400);
+        }
+        if (!start_date || !end_date) {
+            return errorResponse(res, 'Start date and end date are required.', 400);
+        }
         const companyId = req.user.company_id;
         const [result] = await db.query(
             `INSERT INTO leave_requests (company_id, user_id, leave_type, start_date, end_date, reason) VALUES (?, ?, ?, ?, ?, ?)`,
@@ -167,7 +184,10 @@ exports.createLeaveRequest = async (req, res) => {
         );
         await createNotification({ companyId, roleTarget: 'admin', type: 'alert', title: 'Leave Request Submitted', message: `${req.user.name || 'Staff'} requested ${leave_type} leave (${start_date} to ${end_date})`, link: '/dashboard/leave' });
         return successResponse(res, { id: result.insertId }, 'Leave request submitted.', 201);
-    } catch (err) { return errorResponse(res, 'Failed to submit leave request.', 500); }
+    } catch (err) {
+        console.error('Create leave request error:', err);
+        return errorResponse(res, 'Failed to submit leave request.', 500);
+    }
 };
 
 exports.updateLeaveRequest = async (req, res) => {

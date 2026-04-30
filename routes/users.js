@@ -8,7 +8,7 @@ const { scopeByCompany } = require('../middleware/company');
 router.use(verifyToken, scopeByCompany);
 
 // GET customer-role users only (for order client dropdown)
-router.get('/customers', requireRole('super_admin', 'admin', 'operation', 'saas_client', 'client', 'procurement', 'inventory'), ctrl.getCustomers);
+router.get('/customers', requireRole('super_admin', 'admin', 'operation', 'saas_client', 'client', 'procurement', 'inventory', 'concierge', 'logistics'), ctrl.getCustomers);
 
 // GET all users — admin, super_admin, ops, logistics, saas_client, client can view staff
 router.get('/', requireRole('super_admin', 'admin', 'operation', 'logistics', 'saas_client', 'client', 'procurement', 'inventory'), ctrl.getAll);

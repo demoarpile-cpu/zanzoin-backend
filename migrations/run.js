@@ -150,6 +150,40 @@ const migrations = [
             await addColumnIfMissing('vendors', 'delivery', 'DECIMAL(5,2) NOT NULL DEFAULT 0.00', 'rating');
             console.log('  ✅ vendors.rating widened to DECIMAL(5,2); vendors.delivery column ensured');
         }
+    },
+    {
+        name: '010_add_logistics_tracking_and_urgent',
+        up: async () => {
+            await db.query(`
+                CREATE TABLE IF NOT EXISTS logistics_tracking (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    company_id INT NULL,
+                    tracker_id VARCHAR(100) NULL,
+                    asset VARCHAR(255) NULL,
+                    location VARCHAR(255) NULL,
+                    signal_strength VARCHAR(50) DEFAULT 'Strong',
+                    eta VARCHAR(100) NULL,
+                    status VARCHAR(100) DEFAULT 'Active',
+                    delivery_id INT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                )
+            `);
+            await db.query(`
+                CREATE TABLE IF NOT EXISTS logistics_urgent_tasks (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    company_id INT NULL,
+                    task VARCHAR(255) NOT NULL,
+                    time_label VARCHAR(100) DEFAULT 'Immediate',
+                    priority VARCHAR(50) DEFAULT 'Critical',
+                    location VARCHAR(255) NULL,
+                    assignee VARCHAR(255) DEFAULT 'Pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                )
+            `);
+            console.log('  ✅ logistics_tracking and logistics_urgent_tasks tables ensured');
+        }
     }
 ];
 

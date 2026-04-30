@@ -233,3 +233,85 @@ exports.updatePricing = async (req, res) => {
         return successResponse(res, { id: req.params.id, price }, 'Pricing updated.');
     } catch (err) { return errorResponse(res, 'Failed to update pricing.', 500); }
 };
+
+// --- TRACKING ---
+exports.getTracking = async (req, res) => {
+    try {
+        const cf = companyFilter(req);
+        const [rows] = await db.query(`SELECT * FROM logistics_tracking WHERE 1=1 ${cf.clause} ORDER BY created_at DESC`, cf.params);
+        return successResponse(res, rows);
+    } catch (err) { return errorResponse(res, 'Failed to fetch tracking.', 500); }
+};
+
+exports.createTracking = async (req, res) => {
+    try {
+        const { tracker_id, asset, location, signal, eta, status, delivery_id } = req.body;
+        const companyId = req.companyScope;
+        const [result] = await db.query(
+            `INSERT INTO logistics_tracking (company_id, tracker_id, asset, location, signal_strength, eta, status, delivery_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [companyId, tracker_id || null, asset || null, location || null, signal || 'Strong', eta || null, status || 'Active', delivery_id || null]
+        );
+        return successResponse(res, { id: result.insertId }, 'Tracking added.', 201);
+    } catch (err) { return errorResponse(res, 'Failed to add tracking.', 500); }
+};
+
+exports.updateTracking = async (req, res) => {
+    try {
+        const { tracker_id, asset, location, signal, eta, status, delivery_id } = req.body;
+        const cs = companyScope(req);
+        await db.query(
+            `UPDATE logistics_tracking SET tracker_id = COALESCE(?, tracker_id), asset = COALESCE(?, asset), location = COALESCE(?, location), signal_strength = COALESCE(?, signal_strength), eta = COALESCE(?, eta), status = COALESCE(?, status), delivery_id = COALESCE(?, delivery_id) WHERE id = ?${cs.clause}`,
+            [tracker_id, asset, location, signal, eta, status, delivery_id, req.params.id, ...cs.params]
+        );
+        return successResponse(res, { id: req.params.id }, 'Tracking updated.');
+    } catch (err) { return errorResponse(res, 'Failed to update tracking.', 500); }
+};
+
+exports.deleteTracking = async (req, res) => {
+    try {
+        const cs = companyScope(req);
+        await db.query(`DELETE FROM logistics_tracking WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
+        return successResponse(res, null, 'Tracking deleted.');
+    } catch (err) { return errorResponse(res, 'Failed to delete tracking.', 500); }
+};
+
+// --- URGENT ---
+exports.getUrgentTasks = async (req, res) => {
+    try {
+        const cf = companyFilter(req);
+        const [rows] = await db.query(`SELECT * FROM logistics_urgent_tasks WHERE 1=1 ${cf.clause} ORDER BY created_at DESC`, cf.params);
+        return successResponse(res, rows);
+    } catch (err) { return errorResponse(res, 'Failed to fetch urgent tasks.', 500); }
+};
+
+exports.createUrgentTask = async (req, res) => {
+    try {
+        const { task, time, priority, location, assignee } = req.body;
+        const companyId = req.companyScope;
+        const [result] = await db.query(
+            `INSERT INTO logistics_urgent_tasks (company_id, task, time_label, priority, location, assignee) VALUES (?, ?, ?, ?, ?, ?)`,
+            [companyId, task || 'Urgent Mission', time || 'Immediate', priority || 'Critical', location || null, assignee || 'Pending']
+        );
+        return successResponse(res, { id: result.insertId }, 'Urgent task added.', 201);
+    } catch (err) { return errorResponse(res, 'Failed to add urgent task.', 500); }
+};
+
+exports.updateUrgentTask = async (req, res) => {
+    try {
+        const { task, time, priority, location, assignee } = req.body;
+        const cs = companyScope(req);
+        await db.query(
+            `UPDATE logistics_urgent_tasks SET task = COALESCE(?, task), time_label = COALESCE(?, time_label), priority = COALESCE(?, priority), location = COALESCE(?, location), assignee = COALESCE(?, assignee) WHERE id = ?${cs.clause}`,
+            [task, time, priority, location, assignee, req.params.id, ...cs.params]
+        );
+        return successResponse(res, { id: req.params.id }, 'Urgent task updated.');
+    } catch (err) { return errorResponse(res, 'Failed to update urgent task.', 500); }
+};
+
+exports.deleteUrgentTask = async (req, res) => {
+    try {
+        const cs = companyScope(req);
+        await db.query(`DELETE FROM logistics_urgent_tasks WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
+        return successResponse(res, null, 'Urgent task deleted.');
+    } catch (err) { return errorResponse(res, 'Failed to delete urgent task.', 500); }
+};
