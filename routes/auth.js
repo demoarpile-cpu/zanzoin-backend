@@ -11,6 +11,12 @@ router.post('/register', verifyToken, authController.register);
 router.post('/forgot-password', authController.forgotPassword);
 router.post('/reset-password', authController.resetPassword);
 
+// Public self-signup (Personal / Business / SaaS) — no token required
+router.post('/signup', upload.single('businessLicense'), authController.publicSignup);
+
+// Authenticated profile update
+router.put('/profile', verifyToken, authController.updateProfile);
+
 // Staff self-registration (multipart)
 router.post('/staff-register', upload.fields([
     { name: 'passport', maxCount: 1 },

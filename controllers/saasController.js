@@ -24,16 +24,32 @@ exports.createPlan = async (req, res) => {
 
 exports.updatePlan = async (req, res) => {
     try {
-        const fields = req.body;
-        const sets = [], values = [];
-        for (const [k, v] of Object.entries(fields)) {
-            if (['id', 'created_at'].includes(k)) continue;
-            sets.push(`${k} = ?`); values.push(k === 'features' ? JSON.stringify(v) : v);
+        const body = req.body;
+
+        // Only allow actual DB columns — reject frontend-only mapped fields
+        const allowed = ['name', 'price', 'billing_cycle', 'features', 'max_users', 'max_orders', 'status'];
+
+        // price might come as formatted string like "$299" — strip to number
+        if (body.price && typeof body.price === 'string') {
+            body.price = parseFloat(body.price.replace(/[^0-9.]/g, '')) || 0;
         }
+
+        const sets = [], values = [];
+        for (const [k, v] of Object.entries(body)) {
+            if (!allowed.includes(k)) continue;
+            if (['id', 'created_at', 'updated_at'].includes(k)) continue;
+            sets.push(`${k} = ?`);
+            values.push(k === 'features' ? JSON.stringify(v) : v);
+        }
+
+        if (sets.length === 0) return errorResponse(res, 'No valid fields to update.', 400);
         values.push(req.params.id);
         await db.query(`UPDATE saas_plans SET ${sets.join(', ')} WHERE id = ?`, values);
         return successResponse(res, { id: req.params.id }, 'Plan updated.');
-    } catch (err) { return errorResponse(res, 'Failed to update plan.', 500); }
+    } catch (err) {
+        console.error('Update plan error:', err.message);
+        return errorResponse(res, 'Failed to update plan.', 500);
+    }
 };
 
 exports.deletePlan = async (req, res) => {

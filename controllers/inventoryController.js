@@ -159,11 +159,20 @@ exports.createWarehouse = async (req, res) => {
     try {
         const { name, location, capacity, manager_id } = req.body;
         const companyId = req.body.company_id || req.companyScope;
+        const cap = parseInt(capacity) || 0;
         const [result] = await db.query(
-            `INSERT INTO warehouses (company_id, name, location, capacity, manager_id) VALUES (?, ?, ?, ?, ?)`,
-            [companyId, name, location || null, parseInt(capacity) || 0, manager_id || null]
+            `INSERT INTO warehouses (company_id, name, location, capacity, manager_id, status) VALUES (?, ?, ?, ?, ?, ?)`,
+            [companyId, name, location || null, cap, manager_id || null, 'active']
         );
-        return successResponse(res, { id: result.insertId, name }, 'Warehouse created.', 201);
+        return successResponse(res, { 
+            id: result.insertId, 
+            company_id: companyId,
+            name, 
+            location: location || null, 
+            capacity: cap, 
+            manager_id: manager_id || null,
+            status: 'active'
+        }, 'Warehouse created.', 201);
     } catch (err) { 
         console.error('Create warehouse error:', err);
         return errorResponse(res, 'Failed to create warehouse.', 500); 
@@ -177,15 +186,23 @@ exports.updateWarehouse = async (req, res) => {
         
         let validStatus = status;
         if (status && !['active', 'inactive', 'maintenance'].includes(status.toLowerCase())) {
-            validStatus = 'active'; // fallback for invalid enums like 'Stable'
+            validStatus = 'active'; // fallback for invalid enums
         }
+
+        const cap = capacity !== undefined ? parseInt(capacity) || 0 : undefined;
 
         await db.query(
             `UPDATE warehouses SET name = COALESCE(?, name), location = COALESCE(?, location), capacity = COALESCE(?, capacity), manager_id = COALESCE(?, manager_id), status = COALESCE(?, status) WHERE id = ?${cs.clause}`,
-            [name, location, capacity !== undefined ? parseInt(capacity) || 0 : undefined, manager_id, validStatus ? validStatus.toLowerCase() : undefined, req.params.id, ...cs.params]
+            [name, location, cap, manager_id, validStatus ? validStatus.toLowerCase() : undefined, req.params.id, ...cs.params]
         );
-        return successResponse(res, { id: req.params.id }, 'Warehouse updated.');
-    } catch (err) { return errorResponse(res, 'Failed to update warehouse.', 500); }
+
+        // Fetch the updated warehouse to return full data
+        const [rows] = await db.query(`SELECT * FROM warehouses WHERE id = ?`, [req.params.id]);
+        return successResponse(res, rows[0], 'Warehouse updated.');
+    } catch (err) { 
+        console.error('Update warehouse error:', err);
+        return errorResponse(res, 'Failed to update warehouse.', 500); 
+    }
 };
 
 exports.deleteWarehouse = async (req, res) => {

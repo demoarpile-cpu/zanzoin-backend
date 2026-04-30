@@ -73,7 +73,14 @@ exports.createDelivery = async (req, res) => {
         }
 
         // Sanitize order_id - must be valid integer or null (foreign key constraint)
-        const safeOrderId = order_id && !isNaN(Number(order_id)) ? Number(order_id) : null;
+        const rawOrderId = order_id && !isNaN(Number(order_id)) ? Number(order_id) : null;
+
+        // Validate the order actually exists to prevent FK constraint failure
+        let safeOrderId = null;
+        if (rawOrderId) {
+            const [orderCheck] = await db.query('SELECT id FROM orders WHERE id = ?', [rawOrderId]);
+            safeOrderId = orderCheck.length > 0 ? rawOrderId : null;
+        }
 
         // Sanitize delivery_date - must be valid date or null
         const safeDeliveryDate = delivery_date && delivery_date !== '' ? delivery_date : null;

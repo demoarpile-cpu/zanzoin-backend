@@ -15,7 +15,11 @@ exports.login = async (req, res) => {
         }
 
         const [users] = await db.query(
-            'SELECT u.*, c.name as company_name, c.plan as company_plan, c.client_type, c.tagline FROM users u LEFT JOIN companies c ON u.company_id = c.id WHERE u.email = ?',
+            `SELECT u.*, c.name as company_name, c.plan as company_plan,
+                    c.client_type, c.tagline, c.tenant_type, c.status as company_status
+             FROM users u
+             LEFT JOIN companies c ON u.company_id = c.id
+             WHERE u.email = ?`,
             [email]
         );
 
@@ -110,13 +114,23 @@ exports.login = async (req, res) => {
                 role: user.role,
                 company_id: user.company_id,
                 company_name: user.company_name,
+                // Tenant info
+                tenant_id: user.company_id,
+                tenant_type: user.tenant_type || 'zanezion',
                 plan: user.company_plan || 'Free',
                 client_type: user.client_type || 'SaaS',
                 is_personal: user.tagline === 'Personal' || user.company_plan === 'Free',
                 phone: user.phone,
                 profile_pic_url: user.profile_pic_url,
                 is_available: user.is_available,
-                status: user.status
+                status: user.status,
+                // Profile fields
+                birthday: user.birthday ? user.birthday.toISOString().split('T')[0] : null,
+                bank_name: user.bank_name || null,
+                account_number: user.account_number || null,
+                routing_number: user.routing_number || null,
+                nib_number: user.nib_number || null,
+                vacation_balance: user.vacation_balance ?? 0,
             },
             menuPermissions
         }, 'Login successful');
@@ -239,6 +253,179 @@ exports.forgotPassword = async (req, res) => {
     } catch (err) {
         console.error('Forgot password error:', err);
         return errorResponse(res, 'Failed to send reset code.', 500);
+    }
+};
+
+// POST /api/auth/signup  — Public self-registration (Personal / Business / SaaS)
+exports.publicSignup = async (req, res) => {
+    try {
+        const { name, email, password, phone, accountType, companyName } = req.body;
+
+        if (!name || !email || !password) {
+            return errorResponse(res, 'Name, email, and password are required.', 400);
+        }
+        if (!['personal', 'business', 'saas'].includes(accountType)) {
+            return errorResponse(res, 'Invalid account type.', 400);
+        }
+
+        const cleanEmail = email.toLowerCase().trim();
+
+        // Check duplicate email
+        const [existing] = await db.query('SELECT id FROM users WHERE email = ?', [cleanEmail]);
+        if (existing.length > 0) {
+            return errorResponse(res, 'Email already registered.', 409);
+        }
+
+        const hashedPassword = await bcrypt.hash(password, 12);
+
+        // ── PERSONAL ACCOUNT ─────────────────────────────────────────────────
+        // No company, instant activation, role = customer
+        if (accountType === 'personal') {
+            const [result] = await db.query(
+                `INSERT INTO users (name, email, password, phone, role, status)
+                 VALUES (?, ?, ?, ?, 'customer', 'active')`,
+                [name.trim(), cleanEmail, hashedPassword, phone || null]
+            );
+            return successResponse(res, {
+                id: result.insertId, name, email: cleanEmail,
+                role: 'customer', status: 'active'
+            }, 'Personal account created. You can log in now.', 201);
+        }
+
+        // ── BUSINESS ACCOUNT ──────────────────────────────────────────────────
+        // Creates a new tenant (company) with type=Business
+        // User gets role = 'client', status = pending until super_admin approves
+        if (accountType === 'business') {
+            const businessLicenseUrl = req.file ? `/uploads/${req.file.filename}` : null;
+
+            const [companyResult] = await db.query(
+                `INSERT INTO companies (name, email, phone, client_type, tenant_type, status, source)
+                 VALUES (?, ?, ?, 'Business', 'business', 'pending', 'self_signup')`,
+                [companyName || name, cleanEmail, phone || null]
+            );
+            const companyId = companyResult.insertId;
+
+            const [userResult] = await db.query(
+                `INSERT INTO users (name, email, password, phone, role, company_id, business_license_url, status)
+                 VALUES (?, ?, ?, ?, 'client', ?, ?, 'pending')`,
+                [name.trim(), cleanEmail, hashedPassword, phone || null, companyId, businessLicenseUrl]
+            );
+
+            try {
+                const { createNotification } = require('./notificationController');
+                await createNotification({
+                    roleTarget: 'super_admin',
+                    type: 'signup',
+                    title: 'New Business Account Pending',
+                    message: `${name} (${companyName || name}) applied for a Business account. License review required.`,
+                    link: '/dashboard/clients'
+                });
+            } catch (e) { /* non-critical */ }
+
+            return successResponse(res, {
+                id: userResult.insertId, name, email: cleanEmail,
+                role: 'client', status: 'pending', companyId
+            }, 'Business account submitted for review. You will be notified upon approval.', 201);
+        }
+
+        // ── SAAS ACCOUNT ──────────────────────────────────────────────────────
+        // Creates a new isolated TENANT (company) with type=SaaS
+        // User becomes the TENANT ADMIN (role = 'admin') of that tenant
+        // They can then add their own staff (operations, logistics, etc.)
+        if (accountType === 'saas') {
+            const [companyResult] = await db.query(
+                `INSERT INTO companies (name, email, phone, client_type, tenant_type, status, source, saas_fee_paid)
+                 VALUES (?, ?, ?, 'SaaS', 'saas', 'pending', 'self_signup', FALSE)`,
+                [companyName || name, cleanEmail, phone || null]
+            );
+            const companyId = companyResult.insertId;
+
+            // SaaS user = Tenant Admin of their own company
+            const [userResult] = await db.query(
+                `INSERT INTO users (name, email, password, phone, role, company_id, status)
+                 VALUES (?, ?, ?, ?, 'admin', ?, 'pending')`,
+                [name.trim(), cleanEmail, hashedPassword, phone || null, companyId]
+            );
+
+            try {
+                const { createNotification } = require('./notificationController');
+                await createNotification({
+                    roleTarget: 'super_admin',
+                    type: 'signup',
+                    title: 'New SaaS Tenant Pending',
+                    message: `${name} signed up for SaaS membership. Payment & review required.`,
+                    link: '/dashboard/saas-clients'
+                });
+            } catch (e) { /* non-critical */ }
+
+            return successResponse(res, {
+                id: userResult.insertId, name, email: cleanEmail,
+                role: 'admin', status: 'pending', companyId,
+                tenantId: companyId
+            }, 'SaaS account submitted for review. You will be notified upon approval.', 201);
+        }
+
+    } catch (err) {
+        console.error('Public signup error:', err);
+        return errorResponse(res, 'Signup failed. Please try again.', 500);
+    }
+};
+
+// PUT /api/auth/profile  — Authenticated profile update
+exports.updateProfile = async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { name, email, phone, password, birthday, bankName, accountNumber, routingNumber, nibNumber } = req.body;
+
+        // Build dynamic update query
+        const sets = [];
+        const values = [];
+
+        if (name)          { sets.push('name = ?');            values.push(name.trim()); }
+        if (email)         { sets.push('email = ?');           values.push(email.toLowerCase().trim()); }
+        if (phone !== undefined) { sets.push('phone = ?');     values.push(phone || null); }
+        if (birthday)      { sets.push('birthday = ?');        values.push(birthday); }
+        if (bankName !== undefined)      { sets.push('bank_name = ?');       values.push(bankName || null); }
+        if (accountNumber !== undefined) { sets.push('account_number = ?');  values.push(accountNumber || null); }
+        if (routingNumber !== undefined) { sets.push('routing_number = ?');  values.push(routingNumber || null); }
+        if (nibNumber !== undefined)     { sets.push('nib_number = ?');      values.push(nibNumber || null); }
+
+        if (password && password.trim().length >= 8) {
+            const hashed = await bcrypt.hash(password, 12);
+            sets.push('password = ?');
+            values.push(hashed);
+        }
+
+        if (sets.length === 0) {
+            return errorResponse(res, 'No fields to update.', 400);
+        }
+
+        values.push(userId);
+        await db.query(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`, values);
+
+        // Return updated user data
+        const [rows] = await db.query(
+            'SELECT id, name, email, phone, role, company_id, birthday, bank_name, account_number, routing_number, nib_number, vacation_balance, profile_pic_url FROM users WHERE id = ?',
+            [userId]
+        );
+        const updated = rows[0];
+
+        return successResponse(res, {
+            id: updated.id,
+            name: updated.name,
+            email: updated.email,
+            phone: updated.phone,
+            birthday: updated.birthday ? updated.birthday.toISOString().split('T')[0] : null,
+            bank_name: updated.bank_name,
+            account_number: updated.account_number,
+            routing_number: updated.routing_number,
+            nib_number: updated.nib_number,
+            vacation_balance: updated.vacation_balance ?? 0,
+        }, 'Profile updated successfully.');
+
+    } catch (err) {
+        console.error('Update profile error:', err);
+        return errorResponse(res, 'Profile update failed.', 500);
     }
 };
 

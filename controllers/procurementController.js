@@ -199,24 +199,38 @@ exports.updatePO = async (req, res) => {
     try {
         const fields = req.body;
         const sets = [], values = [];
+
+        // Map camelCase frontend keys → DB snake_case columns (only columns that exist in purchase_orders)
         const mapping = {
-            vendorId: 'vendor_id',
-            totalAmount: 'total_amount',
-            total: 'total_amount'
+            vendorId:     'vendor_id',
+            vendor_id:    'vendor_id',
+            totalAmount:  'total_amount',
+            total_amount: 'total_amount',
+            total:        'total_amount',
+            notes:        'notes',
+            status:       'status',
+            items:        'items',
+            paymentTerms: 'payment_terms',
+            payment_terms:'payment_terms'
         };
 
         for (const [k, v] of Object.entries(fields)) {
-            if (['id', 'created_at', 'company_id'].includes(k)) continue;
-            const fieldName = mapping[k] || k;
-            sets.push(`${fieldName} = ?`); 
-            values.push(k === 'items' ? JSON.stringify(v) : v);
+            const dbField = mapping[k];
+            if (!dbField) continue; // ignore unknown / read-only fields
+            sets.push(`${dbField} = ?`);
+            values.push(dbField === 'items' ? JSON.stringify(Array.isArray(v) ? v : []) : v);
         }
+
+        if (sets.length === 0) return successResponse(res, { id: req.params.id }, 'Nothing to update.');
 
         const cs = companyScope(req);
         values.push(req.params.id, ...cs.params);
         await db.query(`UPDATE purchase_orders SET ${sets.join(', ')} WHERE id = ?${cs.clause}`, values);
         return successResponse(res, { id: req.params.id }, 'PO updated.');
-    } catch (err) { return errorResponse(res, 'Failed to update PO.', 500); }
+    } catch (err) {
+        console.error('Update PO error:', err.message);
+        return errorResponse(res, `Failed to update PO: ${err.message}`, 500);
+    }
 };
 
 // PUT /api/procurement/po/:id/receive

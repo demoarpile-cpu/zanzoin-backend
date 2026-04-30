@@ -23,14 +23,14 @@ exports.getAll = async (req, res) => {
                  WHERE c.id != 1`;
             const queryParams = [];
 
-            if (clientType === 'Personal') {
-                // Personal tab: explicit Personal type OR Free plan, scoped to current super admin
-                query += ` AND (c.tagline = 'Personal' OR c.client_type = 'Personal' OR c.plan = 'Free')`;
-                query += ` AND (c.created_by = ? OR c.created_by IS NULL)`;
-                queryParams.push(req.user.id);
+            if (clientType === 'Business') {
+                // Business tab: signed up via website as business account
+                query += ` AND (c.client_type = 'Business' OR c.tenant_type = 'business')`;
             } else if (clientType === 'SaaS') {
-                // SaaS tab: Must be SaaS type AND NOT Personal tagline AND NOT Free plan
-                query += ` AND c.client_type = 'SaaS' AND (c.tagline != 'Personal' OR c.tagline IS NULL) AND (c.plan != 'Free' OR c.plan IS NULL)`;
+                // SaaS tab: SaaS type, not business, not personal
+                query += ` AND c.client_type = 'SaaS' AND (c.tenant_type = 'saas' OR c.tenant_type IS NULL) AND (c.tagline != 'Personal' OR c.tagline IS NULL)`;
+            } else if (clientType === 'Personal') {
+                query += ` AND (c.tagline = 'Personal' OR c.client_type = 'Personal' OR c.plan = 'Free')`;
             } else if (clientType) {
                 query += ` AND c.client_type = ?`;
                 queryParams.push(clientType);
@@ -262,22 +262,27 @@ exports.update = async (req, res) => {
             }
         }
 
-        // Sync back to saas_requests if linked
+        // Sync back to saas_requests if linked (saas_requests may not have company_id — skip safely)
         if (isSuperAdmin) {
-            const [linkedReq] = await db.query('SELECT id FROM saas_requests WHERE company_id = ?', [req.params.id]);
-            if (linkedReq.length > 0) {
-                const syncSets = [];
-                const syncVals = [];
-                if (rawFields.name) { syncSets.push('client_name = ?'); syncVals.push(rawFields.name); }
-                if (rawFields.email) { syncSets.push('email = ?'); syncVals.push(rawFields.email); }
-                if (rawFields.phone) { syncSets.push('phone = ?'); syncVals.push(rawFields.phone); }
-                if (rawFields.plan) { syncSets.push('plan = ?'); syncVals.push(rawFields.plan); }
-                if (rawFields.contact_person) { syncSets.push('contact_person = ?'); syncVals.push(rawFields.contact_person); }
-                if (rawFields.location) { syncSets.push('country = ?'); syncVals.push(rawFields.location); }
-                if (syncSets.length > 0) {
-                    syncVals.push(linkedReq[0].id);
-                    await db.query(`UPDATE saas_requests SET ${syncSets.join(', ')} WHERE id = ?`, syncVals);
+            try {
+                const [linkedReq] = await db.query(
+                    'SELECT id FROM saas_requests WHERE email = ? LIMIT 1',
+                    [rawFields.email || '']
+                );
+                if (linkedReq.length > 0) {
+                    const syncSets = [];
+                    const syncVals = [];
+                    if (rawFields.name)           { syncSets.push('client_name = ?');    syncVals.push(rawFields.name); }
+                    if (rawFields.phone)          { syncSets.push('phone = ?');           syncVals.push(rawFields.phone); }
+                    if (rawFields.plan)           { syncSets.push('plan = ?');            syncVals.push(rawFields.plan); }
+                    if (rawFields.contact_person) { syncSets.push('contact_person = ?'); syncVals.push(rawFields.contact_person); }
+                    if (syncSets.length > 0) {
+                        syncVals.push(linkedReq[0].id);
+                        await db.query(`UPDATE saas_requests SET ${syncSets.join(', ')} WHERE id = ?`, syncVals);
+                    }
                 }
+            } catch (syncErr) {
+                console.log('saas_requests sync skipped:', syncErr.message);
             }
         }
 

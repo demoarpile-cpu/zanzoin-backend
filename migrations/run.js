@@ -80,6 +80,64 @@ const migrations = [
         up: async () => {
             await addColumnIfMissing('purchase_requests', 'department', 'VARCHAR(255)', 'notes');
         }
+    },
+    {
+        name: '008_purchase_orders_payment_terms',
+        up: async () => {
+            await addColumnIfMissing('purchase_orders', 'payment_terms', "VARCHAR(255) DEFAULT 'Net 30'", 'notes');
+            // Also ensure orders.status ENUM includes 'delivered'
+            try {
+                await db.query(`
+                    ALTER TABLE orders
+                    MODIFY COLUMN status ENUM('created','admin_review','operation','procurement','inventory','logistics','completed','cancelled','in_progress','delivered') DEFAULT 'created'
+                `);
+                console.log('  ✅ Added delivered to orders.status enum');
+            } catch (e) {
+                console.log('  🕒 orders.status enum update skipped:', e.message);
+            }
+            console.log('  ✅ Added payment_terms to purchase_orders');
+        }
+    },
+    {
+        name: '007_multi_tenant_upgrade',
+        up: async () => {
+            // Add tenant_type to companies
+            await addColumnIfMissing('companies', 'tenant_type', "ENUM('zanezion','saas','business','personal') DEFAULT 'saas'", 'client_type');
+            await addColumnIfMissing('companies', 'saas_fee_paid', 'BOOLEAN DEFAULT FALSE', 'tenant_type');
+
+            // Mark ZaneZion main company as 'zanezion' tenant
+            await db.query(`UPDATE companies SET tenant_type = 'zanezion' WHERE id = 1`);
+
+            // Add 'client' and 'saas_client' to users.role ENUM (was missing — broke signup)
+            await db.query(`
+                ALTER TABLE users
+                MODIFY COLUMN role ENUM(
+                    'super_admin','admin','manager','operation',
+                    'procurement','inventory','logistics','concierge',
+                    'staff','customer','client','saas_client'
+                ) NOT NULL DEFAULT 'staff'
+            `);
+            console.log('  ✅ Added client/saas_client to users.role ENUM');
+
+            // delivery_address on orders (required for customer checkout)
+            await addColumnIfMissing('orders', 'delivery_address', 'VARCHAR(500)', 'location');
+
+            // vacation_balance on users
+            await addColumnIfMissing('users', 'vacation_balance', 'INT DEFAULT 0', 'nib_number');
+
+            // business_license_url on users
+            await addColumnIfMissing('users', 'business_license_url', 'VARCHAR(500)', 'profile_pic_url');
+
+            // client_name on orders (denormalized for speed)
+            await addColumnIfMissing('orders', 'client_name', 'VARCHAR(255)', 'customer_id');
+
+            // Update companies.client_type ENUM to include 'Business'
+            await db.query(`
+                ALTER TABLE companies
+                MODIFY COLUMN client_type ENUM('SaaS','Personal','Business') DEFAULT 'SaaS'
+            `);
+            console.log('  ✅ Multi-tenant upgrade complete');
+        }
     }
 ];
 

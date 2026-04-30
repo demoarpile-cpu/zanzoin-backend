@@ -6,35 +6,55 @@ const { createNotification } = require('./notificationController');
 // GET /api/orders
 exports.getAll = async (req, res) => {
     try {
-        const cf = companyFilter(req, 'o');
         const role = req.user.role;
+        let whereClause = 'WHERE 1=1';
+        const params = [];
 
-        let extraWhere = '';
-        const extraParams = [];
-
-        // Customer sees only their orders (by customer record email OR created by this user)
-        if (role === 'customer') {
-            extraWhere = ' AND (o.customer_id IN (SELECT id FROM customers WHERE email = ?) OR o.created_by = ?)';
-            extraParams.push(req.user.email, req.user.id);
+        // Super admin sees everything (no tenant filter)
+        if (role === 'super_admin') {
+            // no additional filter
         }
+        // Customer sees only their own orders (by email or created_by)
+        else if (role === 'customer') {
+            whereClause += ' AND (o.created_by = ? OR u_creator.email = ?)';
+            params.push(req.user.id, req.user.email);
+        }
+        // Tenant-scoped roles (admin, operation, logistics, etc.) see only their company
+        else if (req.companyScope) {
+            whereClause += ' AND o.company_id = ?';
+            params.push(req.companyScope);
 
-        // Staff sees only orders assigned to them at current stage
-        if (['operation', 'procurement', 'inventory', 'logistics'].includes(role)) {
-            extraWhere = ' AND (o.assigned_to = ? OR o.current_stage = ?)';
-            extraParams.push(req.user.id, role);
+            // Operational staff sees only orders assigned to them or at their stage
+            if (['operation', 'procurement', 'inventory', 'logistics'].includes(role)) {
+                whereClause += ' AND (o.assigned_to = ? OR o.current_stage = ?)';
+                params.push(req.user.id, role);
+            }
         }
 
         const [rows] = await db.query(
-            `SELECT o.*, c.name as customer_name, v.name as vendor_name, u.name as assigned_to_name
+            `SELECT o.*,
+                    c.name AS customer_name,
+                    v.name AS vendor_name,
+                    u.name AS assigned_to_name,
+                    u_creator.name AS created_by_name,
+                    u_creator.email AS created_by_email
              FROM orders o
-             LEFT JOIN customers c ON o.customer_id = c.id
-             LEFT JOIN vendors v ON o.vendor_id = v.id
-             LEFT JOIN users u ON o.assigned_to = u.id
-             WHERE 1=1 ${cf.clause} ${extraWhere}
+             LEFT JOIN customers c    ON o.customer_id = c.id
+             LEFT JOIN vendors v      ON o.vendor_id = v.id
+             LEFT JOIN users u        ON o.assigned_to = u.id
+             LEFT JOIN users u_creator ON o.created_by = u_creator.id
+             ${whereClause}
              ORDER BY o.created_at DESC`,
-            [...cf.params, ...extraParams]
+            params
         );
-        return successResponse(res, rows);
+
+        // Normalize: ensure customer_name / client_name is always populated
+        const normalised = rows.map(o => ({
+            ...o,
+            customer_name: o.client_name || o.customer_name || o.created_by_name || 'Customer',
+        }));
+
+        return successResponse(res, normalised);
     } catch (err) {
         console.error('Get orders error:', err);
         return errorResponse(res, 'Failed to fetch orders.', 500);
@@ -76,41 +96,91 @@ exports.getById = async (req, res) => {
 // POST /api/orders
 exports.create = async (req, res) => {
     try {
-        let { customer_id, vendor_id, type, items, notes, status, due_date, location } = req.body;
-        const companyId = req.body.company_id || req.companyScope;
+        let { customer_id, vendor_id, type, items, notes, due_date, location, delivery_address } = req.body;
+        let companyId = req.body.company_id || req.companyScope;
 
-        if (!companyId) return errorResponse(res, 'Company ID required.', 400);
-
-        // Auto-resolve customer_id for customer role
-        if (req.user.role === 'customer') {
-            // Try to find matching record in customers table
-            const [custRows] = await db.query(
-                'SELECT id FROM customers WHERE email = ? AND company_id = ? LIMIT 1',
-                [req.user.email, companyId]
-            );
-            if (custRows.length > 0) {
-                customer_id = custRows[0].id;
+        // Customer orders → default company (ZaneZion main = 1) so admin can see them
+        if (!companyId) {
+            if (req.user.role === 'customer') {
+                companyId = parseInt(process.env.DEFAULT_COMPANY_ID || 1);
             } else {
-                // Personal client: no record in customers table, set null (created_by tracks the user)
-                customer_id = null;
+                return errorResponse(res, 'Company ID required.', 400);
             }
         }
 
         // Calculate total from items
         let totalAmount = 0;
-        const parsedItems = typeof items === 'string' ? JSON.parse(items) : (items || []);
+        let parsedItems = [];
+        try {
+            parsedItems = typeof items === 'string' ? JSON.parse(items) : (items || []);
+            if (!Array.isArray(parsedItems)) parsedItems = [];
+        } catch {
+            return errorResponse(res, 'Invalid items: must be a JSON array or array of line items.', 400);
+        }
         parsedItems.forEach(item => {
             totalAmount += (parseFloat(item.price || item.unit_price || 0) * parseInt(item.qty || item.quantity || 1));
         });
 
-        // Customer role orders go directly to admin_review queue
+        // Customer orders → admin_review queue; others → created
         const isCustomerRole = req.user.role === 'customer';
         const initialStatus = isCustomerRole ? 'admin_review' : 'created';
 
+        // delivery_address: accept from body or fall back to location field
+        const finalDeliveryAddress = delivery_address || location || null;
+
+        // company_id must exist (FK)
+        const [companyRows] = await db.query('SELECT id FROM companies WHERE id = ?', [companyId]);
+        if (companyRows.length === 0) {
+            return errorResponse(res, 'Invalid company_id: no matching company. Seed a company or fix company_id.', 400);
+        }
+
+        // orders.customer_id → customers.id (NOT users.id). Frontend often sends user id for customers.
+        let resolvedCustomerId =
+            customer_id !== undefined && customer_id !== null && customer_id !== ''
+                ? parseInt(customer_id, 10)
+                : null;
+        if (Number.isNaN(resolvedCustomerId)) resolvedCustomerId = null;
+
+        if (req.user.role === 'customer') {
+            resolvedCustomerId = null;
+            const em = (req.user.email || '').trim().toLowerCase();
+            if (em) {
+                const [custMatch] = await db.query(
+                    `SELECT id FROM customers 
+                     WHERE LOWER(TRIM(email)) = ? 
+                       AND (company_id = ? OR company_id IS NULL)
+                     ORDER BY (company_id <=> ?) DESC, id DESC LIMIT 1`,
+                    [em, companyId, companyId]
+                );
+                if (custMatch.length) resolvedCustomerId = custMatch[0].id;
+            }
+        } else if (resolvedCustomerId != null) {
+            const [custOk] = await db.query('SELECT id FROM customers WHERE id = ?', [resolvedCustomerId]);
+            if (custOk.length === 0) resolvedCustomerId = null;
+        }
+
+        let resolvedVendorId =
+            vendor_id !== undefined && vendor_id !== null && vendor_id !== ''
+                ? parseInt(vendor_id, 10)
+                : null;
+        if (Number.isNaN(resolvedVendorId)) resolvedVendorId = null;
+        if (resolvedVendorId != null) {
+            const [vOk] = await db.query('SELECT id FROM vendors WHERE id = ?', [resolvedVendorId]);
+            if (vOk.length === 0) resolvedVendorId = null;
+        }
+
+        // Schema: orders has location (not delivery_address) and no client_name; use created_by join for label
         const [result] = await db.query(
-            `INSERT INTO orders (company_id, customer_id, vendor_id, created_by, type, items, notes, location, total_amount, status, current_stage, due_date)
+            `INSERT INTO orders
+             (company_id, customer_id, vendor_id, created_by, type, items, notes,
+              location, total_amount, status, current_stage, due_date)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [companyId, customer_id || null, vendor_id || null, req.user.id, type || 'Custom Order', JSON.stringify(parsedItems), notes || null, location || null, totalAmount, initialStatus, initialStatus, due_date || null]
+            [
+                companyId, resolvedCustomerId, resolvedVendorId, req.user.id,
+                type || 'Custom Order', JSON.stringify(parsedItems), notes || null,
+                finalDeliveryAddress,
+                totalAmount, initialStatus, initialStatus, due_date || null
+            ]
         );
 
         const orderId = result.insertId;
@@ -120,7 +190,7 @@ exports.create = async (req, res) => {
             const itemTotal = (parseFloat(item.price || item.unit_price || 0) * parseInt(item.qty || item.quantity || 1));
             await db.query(
                 `INSERT INTO order_items (order_id, product_name, category, qty, unit_price, total_price) VALUES (?, ?, ?, ?, ?, ?)`,
-                [orderId, item.name || item.product_name, item.category || null, item.qty || item.quantity || 1, item.price || item.unit_price || 0, itemTotal]
+                [orderId, item.name || item.product_name || 'Item', item.category || null, item.qty || item.quantity || 1, item.price || item.unit_price || 0, itemTotal]
             );
         }
 
@@ -151,7 +221,12 @@ exports.create = async (req, res) => {
         return successResponse(res, { id: orderId, total_amount: totalAmount }, 'Order created.', 201);
     } catch (err) {
         console.error('Create order error:', err);
-        return errorResponse(res, 'Failed to create order.', 500);
+        const hint = err.sqlMessage || err.message;
+        const msg =
+            process.env.NODE_ENV === 'production'
+                ? 'Failed to create order.'
+                : `Failed to create order. ${hint}`;
+        return errorResponse(res, msg, 500);
     }
 };
 
