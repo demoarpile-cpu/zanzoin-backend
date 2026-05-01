@@ -3,10 +3,50 @@ const { companyFilter, companyScope } = require('../middleware/company');
 const { successResponse, errorResponse } = require('../utils/helpers');
 const { createNotification } = require('./notificationController');
 
+const VALID_ORDER_STATUSES = ['created', 'admin_review', 'operation', 'procurement', 'inventory', 'logistics', 'completed', 'cancelled'];
+
+/** Admin may mutate orders for their tenant OR HQ (personal marketplace checkout). Other roles stay strictly tenant-scoped. */
+function orderMutationScope(req) {
+    if (!req.companyScope) return { clause: '', params: [] };
+    if (req.user.role === 'admin') {
+        const hqId = parseInt(process.env.DEFAULT_COMPANY_ID || 1, 10);
+        return { clause: ' AND (company_id = ? OR company_id = ?)', params: [req.companyScope, hqId] };
+    }
+    return companyScope(req);
+}
+
+/** Map UI / shorthand labels to orders.status ENUM values (MySQL strict ENUM). */
+function normalizeOrderStatus(input) {
+    if (input === undefined || input === null || String(input).trim() === '') return null;
+    const raw = String(input).trim().toLowerCase().replace(/\s+/g, '_');
+    const aliases = {
+        pending: 'admin_review',
+        pending_review: 'admin_review',
+        processing: 'operation',
+        in_progress: 'operation',
+        approved: 'operation',
+        shipped: 'logistics',
+        in_transit: 'logistics',
+        dispatch: 'logistics',
+        delivered: 'completed',
+        fulfilled: 'completed',
+        done: 'completed',
+        canceled: 'cancelled',
+        reject: 'cancelled',
+        processing_legacy: 'operation',
+        processing_review: 'admin_review'
+    };
+    const resolved = aliases[raw] || raw;
+    if (VALID_ORDER_STATUSES.includes(resolved)) return resolved;
+    return null;
+}
+
 // GET /api/orders
 exports.getAll = async (req, res) => {
     try {
-        const role = req.user.role;
+        let role = typeof req.user.role === 'string' ? req.user.role.toLowerCase() : req.user.role;
+        // JWT / UI historically used plural "operations"; DB stage is singular "operation"
+        if (role === 'operations') role = 'operation';
         let whereClause = 'WHERE 1=1';
         const params = [];
 
@@ -19,15 +59,31 @@ exports.getAll = async (req, res) => {
             whereClause += ' AND (o.created_by = ? OR u_creator.email = ?)';
             params.push(req.user.id, req.user.email);
         }
-        // Tenant-scoped roles (admin, operation, logistics, etc.) see only their company
+        // Tenant-scoped roles (admin, operation, logistics, etc.) see their company.
+        // Admins also see DEFAULT_COMPANY_ID (HQ) orders so personal/marketplace checkout is visible alongside tenant work.
         else if (req.companyScope) {
-            whereClause += ' AND o.company_id = ?';
-            params.push(req.companyScope);
+            const hqId = parseInt(process.env.DEFAULT_COMPANY_ID || 1, 10);
+            if (role === 'admin') {
+                whereClause += ' AND (o.company_id = ? OR o.company_id = ?)';
+                params.push(req.companyScope, hqId);
+            } else {
+                whereClause += ' AND o.company_id = ?';
+                params.push(req.companyScope);
+            }
 
             // Operational staff sees only orders assigned to them or at their stage
-            if (['operation', 'procurement', 'inventory', 'logistics'].includes(role)) {
-                whereClause += ' AND (o.assigned_to = ? OR o.current_stage = ?)';
-                params.push(req.user.id, role);
+            // Role must match DB ENUM spelling (singular "operation").
+            const stageRoles = ['operation', 'procurement', 'inventory', 'logistics'];
+            if (stageRoles.includes(role)) {
+                // Marketplace checkout lands in logistics; ops staff often use role "operation" — include logistics queue so orders are visible.
+                if (role === 'operation') {
+                    whereClause +=
+                        ' AND (o.assigned_to = ? OR (o.current_stage IN (\'operation\',\'logistics\') OR o.status IN (\'operation\',\'logistics\')))';
+                    params.push(req.user.id);
+                } else {
+                    whereClause += ' AND (o.assigned_to = ? OR o.current_stage = ? OR o.status = ?)';
+                    params.push(req.user.id, role, role);
+                }
             }
         }
 
@@ -96,16 +152,31 @@ exports.getById = async (req, res) => {
 // POST /api/orders
 exports.create = async (req, res) => {
     try {
-        let { customer_id, vendor_id, type, items, notes, due_date, location, delivery_address } = req.body;
+        let {
+            customer_id,
+            vendor_id,
+            type,
+            items,
+            notes,
+            due_date,
+            order_date,
+            request_date,
+            location,
+            delivery_address,
+            order_kind,
+            delivery_mode,
+            book_chauffeur,
+            custom_request_category,
+            concierge_member
+        } = req.body;
         let companyId = req.body.company_id || req.companyScope;
+        const hqCompanyId = parseInt(process.env.DEFAULT_COMPANY_ID || 1, 10);
 
-        // Customer orders → default company (ZaneZion main = 1) so admin can see them
-        if (!companyId) {
-            if (req.user.role === 'customer') {
-                companyId = parseInt(process.env.DEFAULT_COMPANY_ID || 1);
-            } else {
-                return errorResponse(res, 'Company ID required.', 400);
-            }
+        // Personal (customer) checkout always lands on HQ company — ignores mistaken client company_id so admin + logistics queues stay consistent.
+        if (req.user.role === 'customer') {
+            companyId = hqCompanyId;
+        } else if (!companyId) {
+            return errorResponse(res, 'Company ID required.', 400);
         }
 
         // Calculate total from items
@@ -121,9 +192,58 @@ exports.create = async (req, res) => {
             totalAmount += (parseFloat(item.price || item.unit_price || 0) * parseInt(item.qty || item.quantity || 1));
         });
 
-        // Customer orders → admin_review queue; others → created
+        let notesMerged = notes || null;
+        const metaParts = [];
+        if (delivery_mode) metaParts.push(`delivery_mode:${String(delivery_mode).trim()}`);
+        if (book_chauffeur === true || book_chauffeur === 'true' || book_chauffeur === 1 || book_chauffeur === '1') metaParts.push('book_chauffeur:yes');
+        if (custom_request_category) metaParts.push(`custom_request:${String(custom_request_category).trim()}`);
+        if (concierge_member === true || concierge_member === 'true') metaParts.push('concierge_member:yes');
+        if (order_kind) metaParts.push(`order_kind:${String(order_kind).trim()}`);
+        if (metaParts.length) {
+            const block = `[request_meta] ${metaParts.join('; ')}`;
+            notesMerged = notesMerged ? `${notesMerged}\n\n${block}` : block;
+        }
+
+        // Persist explicit calendar dates (fixes wrong/missing dates on storefront)
+        let orderDateVal = order_date || request_date || null;
+        if (orderDateVal !== null && orderDateVal !== '') {
+            const od = String(orderDateVal).split('T')[0];
+            orderDateVal = /^\d{4}-\d{2}-\d{2}$/.test(od) ? od : null;
+        } else {
+            orderDateVal = null;
+        }
+
+        let dueDateVal = due_date || null;
+        if (dueDateVal) {
+            const dd = String(dueDateVal).split('T')[0];
+            dueDateVal = /^\d{4}-\d{2}-\d{2}$/.test(dd) ? dd : null;
+        }
+
+        // Customer orders routing: marketplace → logistics (delivery team); custom_request → admin_review
         const isCustomerRole = req.user.role === 'customer';
-        const initialStatus = isCustomerRole ? 'admin_review' : 'created';
+        const kindRaw = String(order_kind || '').toLowerCase().trim();
+        const typeNorm = String(type || '').toLowerCase();
+        const isCustomRequest =
+            kindRaw === 'custom_request' ||
+            typeNorm.includes('custom request') ||
+            typeNorm.includes('bespoke');
+
+        let initialStatus = 'created';
+        let initialStage = 'created';
+
+        if (isCustomerRole) {
+            if (isCustomRequest) {
+                initialStatus = 'admin_review';
+                initialStage = 'admin_review';
+            } else {
+                // Normal marketplace checkout → delivery / logistics queue
+                initialStatus = 'logistics';
+                initialStage = 'logistics';
+            }
+        } else {
+            initialStatus = 'created';
+            initialStage = 'created';
+        }
 
         // delivery_address: accept from body or fall back to location field
         const finalDeliveryAddress = delivery_address || location || null;
@@ -173,13 +293,15 @@ exports.create = async (req, res) => {
         const [result] = await db.query(
             `INSERT INTO orders
              (company_id, customer_id, vendor_id, created_by, type, items, notes,
-              location, total_amount, status, current_stage, due_date)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              location, total_amount, status, current_stage, order_date, due_date)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 companyId, resolvedCustomerId, resolvedVendorId, req.user.id,
-                type || 'Custom Order', JSON.stringify(parsedItems), notes || null,
+                type || 'Custom Order', JSON.stringify(parsedItems), notesMerged,
                 finalDeliveryAddress,
-                totalAmount, initialStatus, initialStatus, due_date || null
+                totalAmount, initialStatus, initialStage,
+                orderDateVal || new Date().toISOString().slice(0, 10),
+                dueDateVal || null
             ]
         );
 
@@ -218,6 +340,17 @@ exports.create = async (req, res) => {
             link: '/dashboard/orders'
         });
 
+        if (initialStage === 'logistics') {
+            await createNotification({
+                companyId: companyId,
+                roleTarget: 'logistics',
+                type: 'order',
+                title: `New Marketplace Order #${orderId}`,
+                message: `Delivery assignment queue — total $${totalAmount}`,
+                link: '/dashboard/deliveries'
+            });
+        }
+
         return successResponse(res, { id: orderId, total_amount: totalAmount }, 'Order created.', 201);
     } catch (err) {
         console.error('Create order error:', err);
@@ -233,7 +366,7 @@ exports.create = async (req, res) => {
 // PUT /api/orders/:id
 exports.update = async (req, res) => {
     try {
-        const allowedFields = ['customer_id', 'vendor_id', 'type', 'items', 'notes', 'location', 'total_amount', 'due_date', 'client_id', 'company_id'];
+        const allowedFields = ['customer_id', 'vendor_id', 'type', 'items', 'notes', 'location', 'total_amount', 'due_date', 'order_date', 'client_id', 'company_id'];
         const fkFields = ['customer_id', 'vendor_id', 'client_id', 'company_id'];
         const sets = [];
         const values = [];
@@ -247,7 +380,7 @@ exports.update = async (req, res) => {
             values.push(key === 'items' ? JSON.stringify(cleanVal) : cleanVal);
         }
         if (sets.length === 0) return errorResponse(res, 'No fields to update.', 400);
-        const cs = companyScope(req);
+        const cs = orderMutationScope(req);
         values.push(req.params.id, ...cs.params);
         await db.query(`UPDATE orders SET ${sets.join(', ')} WHERE id = ?${cs.clause}`, values);
 
@@ -267,18 +400,32 @@ exports.update = async (req, res) => {
 // PATCH /api/orders/:id/status
 exports.updateStatus = async (req, res) => {
     try {
-        const { status } = req.body;
-        const cs = companyScope(req);
-        await db.query(`UPDATE orders SET status = ? WHERE id = ?${cs.clause}`, [status, req.params.id, ...cs.params]);
+        const normalized = normalizeOrderStatus(req.body.status);
+        if (!normalized) {
+            return errorResponse(
+                res,
+                `Invalid order status. Use one of: ${VALID_ORDER_STATUSES.join(', ')} (aliases: pending→admin_review, processing→operation, shipped→logistics, delivered→completed).`,
+                400
+            );
+        }
+        const cs = orderMutationScope(req);
+        const [upd] = await db.query(
+            `UPDATE orders SET status = ?, current_stage = ? WHERE id = ?${cs.clause}`,
+            [normalized, normalized, req.params.id, ...cs.params]
+        );
+
+        if (!upd.affectedRows) {
+            return errorResponse(res, 'Order not found or not in your company scope.', 404);
+        }
 
         // Notify about status change
         const [orderRow] = await db.query('SELECT company_id FROM orders WHERE id = ?', [req.params.id]);
         const orderCompanyId = orderRow[0]?.company_id;
-        await createNotification({ companyId: orderCompanyId, roleTarget: 'customer', type: 'order', title: 'Order Status Updated', message: `Order #${req.params.id} is now "${status}"`, link: '/dashboard/client-orders' });
-        await createNotification({ companyId: orderCompanyId, roleTarget: 'admin', type: 'order', title: `Order #${req.params.id} — ${status}`, message: `Status changed to ${status} by ${req.user.name || 'System'}`, link: '/dashboard/orders' });
-        await createNotification({ roleTarget: 'super_admin', type: 'order', title: `Order #${req.params.id} — ${status}`, message: `Status changed to ${status}`, link: '/dashboard/clients' });
+        await createNotification({ companyId: orderCompanyId, roleTarget: 'customer', type: 'order', title: 'Order Status Updated', message: `Order #${req.params.id} is now "${normalized}"`, link: '/dashboard/client-orders' });
+        await createNotification({ companyId: orderCompanyId, roleTarget: 'admin', type: 'order', title: `Order #${req.params.id} — ${normalized}`, message: `Status changed to ${normalized} by ${req.user.name || 'System'}`, link: '/dashboard/orders' });
+        await createNotification({ roleTarget: 'super_admin', type: 'order', title: `Order #${req.params.id} — ${normalized}`, message: `Status changed to ${normalized}`, link: '/dashboard/clients' });
 
-        return successResponse(res, { id: req.params.id, status }, 'Order status updated.');
+        return successResponse(res, { id: req.params.id, status: normalized }, 'Order status updated.');
     } catch (err) {
         return errorResponse(res, 'Failed to update status.', 500);
     }
@@ -296,7 +443,7 @@ exports.assignToStage = async (req, res) => {
         }
 
         // Get current order
-        const cs = companyScope(req);
+        const cs = orderMutationScope(req);
         const [orders] = await db.query(`SELECT * FROM orders WHERE id = ?${cs.clause}`, [id, ...cs.params]);
         if (orders.length === 0) return errorResponse(res, 'Order not found.', 404);
 
@@ -380,7 +527,7 @@ exports.getByCompany = async (req, res) => {
 // DELETE /api/orders/:id
 exports.remove = async (req, res) => {
     try {
-        const cs = companyScope(req);
+        const cs = orderMutationScope(req);
         const [orderRow] = await db.query('SELECT company_id FROM orders WHERE id = ?', [req.params.id]);
         const orderCompanyId = orderRow[0]?.company_id;
 

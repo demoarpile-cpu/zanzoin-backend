@@ -9,7 +9,11 @@ const requireRole = (...allowedRoles) => {
             return next();
         }
 
-        if (!allowedRoles.includes(req.user.role)) {
+        const normalizedUser = String(req.user.role || '').toLowerCase();
+        const effectiveRole = normalizedUser === 'operations' ? 'operation' : normalizedUser;
+
+        const allowed = allowedRoles.some((a) => effectiveRole === String(a).toLowerCase());
+        if (!allowed) {
             return res.status(403).json({ success: false, message: 'Insufficient permissions.' });
         }
 
