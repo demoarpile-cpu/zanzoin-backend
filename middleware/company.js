@@ -5,8 +5,10 @@ const scopeByCompany = (req, res, next) => {
         return res.status(401).json({ success: false, message: 'Not authenticated.' });
     }
 
-    // Super admin sees everything — no tenant scoping
-    if (req.user.role === 'super_admin') {
+    const roleNorm = String(req.user.role || '').toLowerCase().replace(/\s+/g, '');
+
+    // Super admin sees everything — no tenant scoping (JWT may use superadmin or super_admin)
+    if (roleNorm === 'super_admin' || roleNorm === 'superadmin') {
         req.companyScope = null;
         req.isSuperAdmin = true;
         return next();

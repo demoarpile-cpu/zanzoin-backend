@@ -5,12 +5,23 @@ const { createNotification } = require('./notificationController');
 
 const VALID_ORDER_STATUSES = ['created', 'admin_review', 'operation', 'procurement', 'inventory', 'logistics', 'completed', 'cancelled'];
 
-/** Admin may mutate orders for their tenant OR HQ (personal marketplace checkout). Other roles stay strictly tenant-scoped. */
+/** Admin may mutate orders for their tenant OR HQ (personal marketplace checkout). */
 function orderMutationScope(req) {
+    const roleNorm = String(req.user.role || '').toLowerCase().replace(/\s+/g, '');
+    if (roleNorm === 'super_admin' || roleNorm === 'superadmin') return { clause: '', params: [] };
     if (!req.companyScope) return { clause: '', params: [] };
-    if (req.user.role === 'admin') {
-        const hqId = parseInt(process.env.DEFAULT_COMPANY_ID || 1, 10);
+    const hqId = parseInt(process.env.DEFAULT_COMPANY_ID || 1, 10);
+    const role = roleNorm;
+    if (role === 'admin') {
         return { clause: ' AND (company_id = ? OR company_id = ?)', params: [req.companyScope, hqId] };
+    }
+    // Match GET /orders: tenant ops/logistics may update rows on HQ when they are in fulfilment stages.
+    if (role === 'operation' || role === 'operations' || role === 'logistics') {
+        return {
+            clause:
+                ' AND (company_id = ? OR (company_id = ? AND (current_stage IN (\'operation\',\'logistics\') OR status IN (\'operation\',\'logistics\'))))',
+            params: [req.companyScope, hqId],
+        };
     }
     return companyScope(req);
 }
@@ -20,8 +31,14 @@ function normalizeOrderStatus(input) {
     if (input === undefined || input === null || String(input).trim() === '') return null;
     const raw = String(input).trim().toLowerCase().replace(/\s+/g, '_');
     const aliases = {
-        pending: 'admin_review',
+        // Human-readable labels from UI / tables
+        submitted: 'created',
         pending_review: 'admin_review',
+        in_operations: 'operation',
+        operations: 'operation',
+        logistics_dispatch: 'logistics',
+        out_for_delivery: 'logistics',
+        pending: 'admin_review',
         processing: 'operation',
         in_progress: 'operation',
         approved: 'operation',
@@ -44,7 +61,8 @@ function normalizeOrderStatus(input) {
 // GET /api/orders
 exports.getAll = async (req, res) => {
     try {
-        let role = typeof req.user.role === 'string' ? req.user.role.toLowerCase() : req.user.role;
+        let role = typeof req.user.role === 'string' ? req.user.role.toLowerCase().replace(/\s+/g, '') : req.user.role;
+        if (role === 'superadmin') role = 'super_admin';
         // JWT / UI historically used plural "operations"; DB stage is singular "operation"
         if (role === 'operations') role = 'operation';
         let whereClause = 'WHERE 1=1';
@@ -65,6 +83,13 @@ exports.getAll = async (req, res) => {
             const hqId = parseInt(process.env.DEFAULT_COMPANY_ID || 1, 10);
             if (role === 'admin') {
                 whereClause += ' AND (o.company_id = ? OR o.company_id = ?)';
+                params.push(req.companyScope, hqId);
+            } else if (role === 'operation' || role === 'logistics') {
+                // Marketplace / personal checkout is stored on HQ (DEFAULT_COMPANY_ID). Tenant operations &
+                // logistics users must still see that fulfilment queue; otherwise lists look "empty" while
+                // notifications say a new order exists.
+                whereClause +=
+                    ' AND (o.company_id = ? OR (o.company_id = ? AND (o.current_stage IN (\'operation\',\'logistics\') OR o.status IN (\'operation\',\'logistics\'))))';
                 params.push(req.companyScope, hqId);
             } else {
                 whereClause += ' AND o.company_id = ?';
