@@ -32,15 +32,17 @@ exports.getCustomers = async (req, res) => {
 exports.getAll = async (req, res) => {
     try {
         const cf = companyFilter(req);
+        const roleNorm = String(req.user.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin', 'super admin'].includes(roleNorm.replace(/\s+/g, ' ')) || ['super_admin', 'superadmin'].includes(roleNorm);
         // Non-superadmin: exclude only customer roles (they are managed separately)
-        const excludeRoles = req.user.role !== 'super_admin' ? " AND u.role NOT IN ('customer')" : '';
+        const excludeRoles = !isSuperAdmin ? " AND u.role NOT IN ('customer')" : '';
         const [rows] = await db.query(
             `SELECT u.id, u.company_id, u.name, u.email, u.phone, u.role,
                     u.is_available, u.employment_status, u.status, u.joined_date,
                     u.profile_pic_url, u.birthday, u.bank_name, u.account_number,
                     u.routing_number, u.nib_number, u.vacation_balance,
                     u.passport_url, u.license_url, u.nib_doc_url, u.police_record_url,
-                    u.business_license_url, c.name as company_name
+                    u.business_license_url, c.name as company_name, c.client_type, c.tenant_type
              FROM users u LEFT JOIN companies c ON u.company_id = c.id
              WHERE 1=1 ${cf.clause}${excludeRoles} ORDER BY u.created_at DESC`,
             cf.params

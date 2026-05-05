@@ -5,13 +5,18 @@ const { generatePassword, successResponse, errorResponse } = require('../utils/h
 const { createNotification } = require('./notificationController');
 const { sendMail } = require('../utils/mailer');
 
+function isSuperAdminRole(role) {
+    const r = String(role || '').trim().toLowerCase();
+    return r === 'super_admin' || r === 'superadmin' || r === 'super admin';
+}
+
 // GET /api/customers (aliased as /api/clients)
 exports.getAll = async (req, res) => {
     try {
         const role = req.user.role;
 
         // Super Admin → sees companies, filtered by client_type if provided
-        if (role === 'super_admin') {
+        if (isSuperAdminRole(role)) {
             const clientType = req.query.client_type;
             
             // Special handling for Personal clients stored as SaaS + tagline metadata
@@ -59,7 +64,7 @@ exports.getAll = async (req, res) => {
 // GET /api/customers/:id
 exports.getById = async (req, res) => {
     try {
-        const isSuperAdmin = req.user.role === 'super_admin';
+        const isSuperAdmin = isSuperAdminRole(req.user.role);
         const table = isSuperAdmin ? 'companies' : 'customers';
         const cs = companyScope(req);
         
@@ -95,7 +100,7 @@ exports.create = async (req, res) => {
                 return errorResponse(res, 'This email is already associated with an existing client/customer record.', 400);
             }
         }
-        if (role === 'super_admin') {
+        if (isSuperAdminRole(role)) {
             // Create company
             const [companyResult] = await db.query(
                 `INSERT INTO companies (name, email, phone, location, plan, billing_cycle, payment_method, contact_person, client_type, logo_url, tagline, source, created_by, status)
@@ -203,7 +208,7 @@ exports.create = async (req, res) => {
 // PUT /api/customers/:id
 exports.update = async (req, res) => {
     try {
-        const isSuperAdmin = req.user.role === 'super_admin';
+        const isSuperAdmin = isSuperAdminRole(req.user.role);
         const table = isSuperAdmin ? 'companies' : 'customers';
 
         const rawFields = { ...req.body };
@@ -296,7 +301,7 @@ exports.update = async (req, res) => {
 // DELETE /api/customers/:id
 exports.remove = async (req, res) => {
     try {
-        const isSuperAdmin = req.user.role === 'super_admin';
+        const isSuperAdmin = isSuperAdminRole(req.user.role);
         const table = isSuperAdmin ? 'companies' : 'customers';
         const cs = companyScope(req);
 
