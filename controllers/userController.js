@@ -81,8 +81,30 @@ exports.create = async (req, res) => {
         if (existing.length > 0) return errorResponse(res, 'Email already exists.', 409);
 
         const hashedPassword = await bcrypt.hash(password, 12);
-        // SuperAdmin ke liye companyScope null hota hai — default ZaneZion HQ (id=1)
-        const assignedCompany = company_id || req.companyScope || 1;
+
+        const normalizeCompanyId = (value) => {
+            if (value == null) return null;
+            if (typeof value === 'string' && value.trim() === '') return null;
+            const n = Number(value);
+            if (!Number.isFinite(n) || Number.isNaN(n) || n <= 0) return null;
+            return n;
+        };
+
+        const normalizedRole = String(req.user?.role || '').toLowerCase().trim().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(normalizedRole);
+        const requestedCompanyId = normalizeCompanyId(company_id ?? body.companyId);
+        const scopedCompanyId = normalizeCompanyId(req.companyScope);
+
+        // Super admin can create HQ users (NULL company_id) or tenant users (valid company_id).
+        // Tenant admins are always scoped to their own company.
+        const assignedCompany = isSuperAdmin ? requestedCompanyId : (scopedCompanyId || requestedCompanyId);
+
+        if (assignedCompany != null) {
+            const [companyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [assignedCompany]);
+            if (!companyRows.length) {
+                return errorResponse(res, 'Invalid company_id. Select a valid workspace/company first.', 400);
+            }
+        }
 
         // Normalize role
         const roleMap = {
@@ -90,8 +112,8 @@ exports.create = async (req, res) => {
             'field_staff': 'staff', 'field staff': 'staff',
             'staff_management': 'admin', 'client_admin': 'admin'
         };
-        let normalizedRole = (body.role || 'staff').toLowerCase().trim().replace(/\s+/g, '_');
-        normalizedRole = roleMap[normalizedRole] || (normalizedRole.includes('staff') ? 'staff' : normalizedRole);
+        let targetRole = (body.role || 'staff').toLowerCase().trim().replace(/\s+/g, '_');
+        targetRole = roleMap[targetRole] || (targetRole.includes('staff') ? 'staff' : targetRole);
 
         // Flatten bankingInfo → DB columns
         let bank_name = null, account_number = null, routing_number = null;
@@ -114,7 +136,7 @@ exports.create = async (req, res) => {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 name, email, hashedPassword, phone || null,
-                normalizedRole, assignedCompany,
+                targetRole, assignedCompany,
                 employment_status || 'Full Time', status || 'active',
                 birthday, bank_name, account_number, routing_number, nib_number, vacation_balance
             ]
@@ -125,11 +147,11 @@ exports.create = async (req, res) => {
             roleTarget: 'admin',
             type: 'alert',
             title: 'New Staff Added',
-            message: `${name} joined as ${normalizedRole}`,
+            message: `${name} joined as ${targetRole}`,
             link: '/dashboard/users'
         });
 
-        return successResponse(res, { id: result.insertId, name, email, role: normalizedRole }, 'User created.', 201);
+        return successResponse(res, { id: result.insertId, name, email, role: targetRole }, 'User created.', 201);
     } catch (err) {
         console.error('Create user failed:', err.message, err.stack);
         return errorResponse(res, `Failed to create user: ${err.message}`, 500);
