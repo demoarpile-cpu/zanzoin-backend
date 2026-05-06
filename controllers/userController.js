@@ -7,12 +7,19 @@ const { createNotification } = require('./notificationController');
 // GET /api/users/customers — returns users with role='customer' for order dropdowns
 exports.getCustomers = async (req, res) => {
     try {
-        // For super_admin/admin: return all customer-role users
-        // company_id may be null for personal signups — include all
+        // Default use-case is order dropdown: active customer-role users only.
+        // Admin customer management can pass query flags to include wider result sets.
         const companyId = req.companyScope; // null for super_admin
+        const includeAll = String(req.query?.include_all || '').toLowerCase() === '1' || String(req.query?.include_all || '').toLowerCase() === 'true';
+        const includeClientRole = String(req.query?.include_client_role || '').toLowerCase() === '1' || String(req.query?.include_client_role || '').toLowerCase() === 'true';
+
         let query = `SELECT id, name, email, phone, role, status, company_id
-                     FROM users WHERE role = 'customer' AND status = 'active'`;
+                     FROM users WHERE role IN (${includeClientRole ? "'customer','client'" : "'customer'"})`;
         const params = [];
+
+        if (!includeAll) {
+            query += ` AND LOWER(COALESCE(status, 'active')) = 'active'`;
+        }
 
         if (companyId) {
             // Also include customers with no company (personal signups via website)

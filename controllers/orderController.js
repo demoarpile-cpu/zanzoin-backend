@@ -638,17 +638,46 @@ exports.getAllProjects = async (req, res) => {
 exports.createProject = async (req, res) => {
     try {
         const { name, description, manager_id, startDate, location, status, company_id } = req.body;
-        const companyId = company_id || req.companyScope;
+        if (!name || !String(name).trim()) {
+            return errorResponse(res, 'Project name is required.', 400);
+        }
+
+        const normalizePositiveInt = (val) => {
+            if (val == null || val === '') return null;
+            const n = Number(val);
+            if (!Number.isFinite(n) || Number.isNaN(n) || n <= 0) return null;
+            return Math.trunc(n);
+        };
+
+        const companyId = normalizePositiveInt(company_id ?? req.companyScope);
+        if (!companyId) {
+            return errorResponse(res, 'Valid company_id is required.', 400);
+        }
+        const [companyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [companyId]);
+        if (!companyRows.length) {
+            return errorResponse(res, 'Invalid company_id. Company not found.', 400);
+        }
+
+        let managerId = normalizePositiveInt(manager_id) || normalizePositiveInt(req.user?.id);
+        if (managerId) {
+            const [mgrRows] = await db.query('SELECT id FROM users WHERE id = ? LIMIT 1', [managerId]);
+            if (!mgrRows.length) managerId = normalizePositiveInt(req.user?.id);
+        }
+
+        const statusRaw = String(status || 'planned').toLowerCase().trim().replace(/\s+/g, '_');
+        const projectStatus = ['planned', 'in_progress', 'completed', 'on_hold'].includes(statusRaw) ? statusRaw : 'planned';
+        const startDateVal = startDate ? String(startDate).split('T')[0] : null;
 
         const [result] = await db.query(
             `INSERT INTO projects (company_id, name, description, manager_id, location, status, start_date) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [companyId, name, description || null, manager_id || req.user.id, location || null, status || 'planned', startDate || null]
+            [companyId, String(name).trim(), description || null, managerId || null, location || null, projectStatus, startDateVal || null]
         );
 
         const [projects] = await db.query(`SELECT p.*, c.name as client_name FROM projects p LEFT JOIN companies c ON p.company_id = c.id WHERE p.id = ?`, [result.insertId]);
         return successResponse(res, projects[0] || { id: result.insertId }, 'Project created.', 201);
     } catch (err) {
-        return errorResponse(res, 'Failed to create project.', 500);
+        console.error('Create project error:', err);
+        return errorResponse(res, `Failed to create project. ${err.sqlMessage || err.message || ''}`.trim(), 500);
     }
 };
 

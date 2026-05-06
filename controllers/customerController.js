@@ -161,8 +161,27 @@ exports.create = async (req, res) => {
         }
 
         // ─── ADMIN/STAFF: creates a customer under their company ───
-        const companyId = req.user.company_id;
+        // Prefer scoped company from middleware; fallback to JWT user company.
+        // For platform admin accounts without tenant binding, allow DEFAULT_COMPANY_ID.
+        const normalizePositiveInt = (val) => {
+            if (val == null || val === '') return null;
+            const n = Number(val);
+            if (!Number.isFinite(n) || Number.isNaN(n) || n <= 0) return null;
+            return Math.trunc(n);
+        };
+        const fallbackCompanyId = normalizePositiveInt(process.env.DEFAULT_COMPANY_ID || 1);
+        const roleNorm = String(role || '').toLowerCase().trim().replace(/\s+/g, '_');
+        const isPlatformAdmin = roleNorm === 'admin';
+        const companyId =
+            normalizePositiveInt(req.companyScope) ||
+            normalizePositiveInt(req.user.company_id) ||
+            (isPlatformAdmin ? fallbackCompanyId : null);
         if (!companyId) return errorResponse(res, 'No company associated.', 400);
+
+        const [companyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [companyId]);
+        if (!companyRows.length) {
+            return errorResponse(res, 'Invalid company mapping. Please create/select a valid company first.', 400);
+        }
 
         // Create customer record
         const [result] = await db.query(
