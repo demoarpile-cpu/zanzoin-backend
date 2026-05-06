@@ -26,9 +26,52 @@ exports.getAll = async (req, res) => {
 exports.create = async (req, res) => {
     try {
         const { name, email, phone, contact_name, contact, category, rating, delivery } = req.body;
+        if (!name || !String(name).trim()) {
+            return errorResponse(res, 'Vendor name is required.', 400);
+        }
         // Accept both 'address' and 'location' from frontend
         const location = req.body.location || req.body.address || null;
-        const companyId = req.body.company_id || req.companyScope;
+        const normalizePositiveInt = (val) => {
+            if (val == null || val === '') return null;
+            const n = Number(val);
+            if (!Number.isFinite(n) || Number.isNaN(n) || n <= 0) return null;
+            return Math.trunc(n);
+        };
+
+        const requestedCompanyId = normalizePositiveInt(req.body.company_id);
+        const scopedCompanyId = normalizePositiveInt(req.companyScope);
+        const fallbackCompanyId = normalizePositiveInt(process.env.DEFAULT_COMPANY_ID || 1);
+        let companyId = requestedCompanyId || scopedCompanyId || fallbackCompanyId;
+
+        if (!companyId) {
+            return errorResponse(res, 'Valid company_id is required to create vendor.', 400);
+        }
+
+        let [companyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [companyId]);
+        if (!companyRows.length && scopedCompanyId) {
+            const [scopedRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [scopedCompanyId]);
+            if (scopedRows.length) {
+                companyId = scopedCompanyId;
+                companyRows = scopedRows;
+            }
+        }
+        if (!companyRows.length && fallbackCompanyId) {
+            const [fallbackRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [fallbackCompanyId]);
+            if (fallbackRows.length) {
+                companyId = fallbackCompanyId;
+                companyRows = fallbackRows;
+            }
+        }
+        if (!companyRows.length) {
+            const [anyCompany] = await db.query('SELECT id FROM companies ORDER BY id ASC LIMIT 1');
+            if (anyCompany.length) {
+                companyId = anyCompany[0].id;
+                companyRows = anyCompany;
+            }
+        }
+        if (!companyRows.length) {
+            return errorResponse(res, 'Invalid company_id. Company not found.', 400);
+        }
 
         const ratingVal = clampPercentMetric(rating);
         const deliveryVal = clampPercentMetric(delivery);
@@ -38,7 +81,7 @@ exports.create = async (req, res) => {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 companyId,
-                name,
+                String(name).trim(),
                 email  || null,
                 phone  || null,
                 contact_name || contact || null,
@@ -48,10 +91,10 @@ exports.create = async (req, res) => {
                 deliveryVal
             ]
         );
-        return successResponse(res, { id: result.insertId, name }, 'Vendor created.', 201);
+        return successResponse(res, { id: result.insertId, name: String(name).trim() }, 'Vendor created.', 201);
     } catch (err) {
-        console.error('Create vendor error:', err.message);
-        return errorResponse(res, 'Failed to create vendor.', 500);
+        console.error('Create vendor error:', err);
+        return errorResponse(res, `Failed to create vendor. ${err.sqlMessage || err.message || ''}`.trim(), 500);
     }
 };
 
