@@ -46,8 +46,36 @@ exports.getAll = async (req, res) => {
             return successResponse(res, rows);
         }
 
-        // Admin/Staff → sees only their company's customers
-        const companyId = req.user.company_id;
+        // Admin/Staff → sees only their company's customers.
+        // Prefer middleware scoped company; fallback to JWT company; for platform admin fallback to DEFAULT_COMPANY_ID.
+        const normalizePositiveInt = (val) => {
+            if (val == null || val === '') return null;
+            const n = Number(val);
+            if (!Number.isFinite(n) || Number.isNaN(n) || n <= 0) return null;
+            return Math.trunc(n);
+        };
+        const roleNorm = String(role || '').toLowerCase().trim().replace(/\s+/g, '_');
+        const fallbackCompanyId = normalizePositiveInt(process.env.DEFAULT_COMPANY_ID || 1);
+        let companyId =
+            normalizePositiveInt(req.companyScope) ||
+            normalizePositiveInt(req.user.company_id) ||
+            (roleNorm === 'admin' ? fallbackCompanyId : null);
+
+        if (companyId) {
+            const [companyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [companyId]);
+            if (!companyRows.length && roleNorm === 'admin') {
+                // Middleware may set a legacy default (1) that doesn't exist in DB.
+                companyId = null;
+            }
+        }
+
+        // If company mapping is missing/invalid for platform admin, pick first available company.
+        if (!companyId && roleNorm === 'admin') {
+            const [anyCompany] = await db.query('SELECT id FROM companies ORDER BY id ASC LIMIT 1');
+            if (anyCompany.length) {
+                companyId = anyCompany[0].id;
+            }
+        }
         if (!companyId) return successResponse(res, []);
 
         const [rows] = await db.query(
