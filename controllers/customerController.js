@@ -172,15 +172,23 @@ exports.create = async (req, res) => {
         const fallbackCompanyId = normalizePositiveInt(process.env.DEFAULT_COMPANY_ID || 1);
         const roleNorm = String(role || '').toLowerCase().trim().replace(/\s+/g, '_');
         const isPlatformAdmin = roleNorm === 'admin';
-        const companyId =
+        let companyId =
             normalizePositiveInt(req.companyScope) ||
             normalizePositiveInt(req.user.company_id) ||
             (isPlatformAdmin ? fallbackCompanyId : null);
         if (!companyId) return errorResponse(res, 'No company associated.', 400);
 
-        const [companyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [companyId]);
+        let [companyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [companyId]);
+        if (!companyRows.length && isPlatformAdmin) {
+            // Fallback for misconfigured DEFAULT_COMPANY_ID: use first available company.
+            const [anyCompany] = await db.query('SELECT id FROM companies ORDER BY id ASC LIMIT 1');
+            if (anyCompany.length) {
+                companyId = anyCompany[0].id;
+                companyRows = anyCompany;
+            }
+        }
         if (!companyRows.length) {
-            return errorResponse(res, 'Invalid company mapping. Please create/select a valid company first.', 400);
+            return errorResponse(res, 'Invalid company mapping. Please create a company first in Clients menu.', 400);
         }
 
         // Create customer record

@@ -649,13 +649,69 @@ exports.createProject = async (req, res) => {
             return Math.trunc(n);
         };
 
-        const companyId = normalizePositiveInt(company_id ?? req.companyScope);
+        const requestedCompanyId = normalizePositiveInt(company_id);
+        const scopedCompanyId = normalizePositiveInt(req.companyScope);
+        const fallbackCompanyId = normalizePositiveInt(process.env.DEFAULT_COMPANY_ID || 1);
+
+        let companyId = requestedCompanyId || scopedCompanyId || fallbackCompanyId;
         if (!companyId) {
             return errorResponse(res, 'Valid company_id is required.', 400);
         }
-        const [companyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [companyId]);
+
+        let [companyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [companyId]);
+
+        if (!companyRows.length && requestedCompanyId) {
+            // Frontend can sometimes send customer/user id in clientId field.
+            // Try resolving that id to a company_id from users/customers tables.
+            const [userRows] = await db.query('SELECT company_id FROM users WHERE id = ? LIMIT 1', [requestedCompanyId]);
+            const userCompanyId = normalizePositiveInt(userRows?.[0]?.company_id);
+            if (userCompanyId) {
+                const [resolvedCompanyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [userCompanyId]);
+                if (resolvedCompanyRows.length) {
+                    companyId = userCompanyId;
+                    companyRows = resolvedCompanyRows;
+                }
+            }
+        }
+
+        if (!companyRows.length && requestedCompanyId) {
+            const [customerRows] = await db.query('SELECT company_id FROM customers WHERE id = ? LIMIT 1', [requestedCompanyId]);
+            const customerCompanyId = normalizePositiveInt(customerRows?.[0]?.company_id);
+            if (customerCompanyId) {
+                const [resolvedCompanyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [customerCompanyId]);
+                if (resolvedCompanyRows.length) {
+                    companyId = customerCompanyId;
+                    companyRows = resolvedCompanyRows;
+                }
+            }
+        }
+
+        if (!companyRows.length && scopedCompanyId) {
+            const [scopedRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [scopedCompanyId]);
+            if (scopedRows.length) {
+                companyId = scopedCompanyId;
+                companyRows = scopedRows;
+            }
+        }
+
+        if (!companyRows.length && fallbackCompanyId) {
+            const [fallbackRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [fallbackCompanyId]);
+            if (fallbackRows.length) {
+                companyId = fallbackCompanyId;
+                companyRows = fallbackRows;
+            }
+        }
+
         if (!companyRows.length) {
-            return errorResponse(res, 'Invalid company_id. Company not found.', 400);
+            const [anyCompany] = await db.query('SELECT id FROM companies ORDER BY id ASC LIMIT 1');
+            if (anyCompany.length) {
+                companyId = anyCompany[0].id;
+                companyRows = anyCompany;
+            }
+        }
+
+        if (!companyRows.length) {
+            return errorResponse(res, 'Invalid company_id. Company not found. Create at least one company first.', 400);
         }
 
         let managerId = normalizePositiveInt(manager_id) || normalizePositiveInt(req.user?.id);
