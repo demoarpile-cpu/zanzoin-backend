@@ -14,7 +14,7 @@ exports.getCustomers = async (req, res) => {
         const includeClientRole = String(req.query?.include_client_role || '').toLowerCase() === '1' || String(req.query?.include_client_role || '').toLowerCase() === 'true';
 
         let query = `SELECT id, name, email, phone, role, status, company_id
-                     FROM users WHERE role IN (${includeClientRole ? "'customer','client'" : "'customer'"})`;
+                     FROM users WHERE role IN (${includeClientRole ? "'customer','client','business_client'" : "'customer'"})`;
         const params = [];
 
         if (!includeAll) {
@@ -38,11 +38,30 @@ exports.getCustomers = async (req, res) => {
 // GET /api/users
 exports.getAll = async (req, res) => {
     try {
-        const cf = companyFilter(req);
         const roleNorm = String(req.user.role || '').toLowerCase().replace(/\s+/g, '_');
-        const isSuperAdmin = ['super_admin', 'superadmin', 'super admin'].includes(roleNorm.replace(/\s+/g, ' ')) || ['super_admin', 'superadmin'].includes(roleNorm);
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm.replace(/\s+/g, '')) || ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user.company_id == 1 || !req.user.company_id || req.companyScope == 1);
+
+        // HQ admins and super admins see ALL users (global view)
+        let cf;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cf = { clause: '', params: [] };
+        } else {
+            cf = companyFilter(req);
+        }
+
+        const qStatus = String(req.query?.status || '').toLowerCase().trim();
+        const qSearch = String(req.query?.search || '').toLowerCase().trim();
         // Non-superadmin: exclude only customer roles (they are managed separately)
         const excludeRoles = !isSuperAdmin ? " AND u.role NOT IN ('customer')" : '';
+        const statusClause = qStatus ? ' AND LOWER(COALESCE(u.status, \'\')) = ?' : '';
+        const searchClause = qSearch ? ' AND (LOWER(COALESCE(u.name, \'\')) LIKE ? OR LOWER(COALESCE(u.email, \'\')) LIKE ?)' : '';
+        const queryParams = [...cf.params];
+        if (qStatus) queryParams.push(qStatus);
+        if (qSearch) {
+            const like = `%${qSearch}%`;
+            queryParams.push(like, like);
+        }
         const [rows] = await db.query(
             `SELECT u.id, u.company_id, u.name, u.email, u.phone, u.role,
                     u.is_available, u.employment_status, u.status, u.joined_date,
@@ -51,8 +70,8 @@ exports.getAll = async (req, res) => {
                     u.passport_url, u.license_url, u.nib_doc_url, u.police_record_url,
                     u.business_license_url, c.name as company_name, c.client_type, c.tenant_type
              FROM users u LEFT JOIN companies c ON u.company_id = c.id
-             WHERE 1=1 ${cf.clause}${excludeRoles} ORDER BY u.created_at DESC`,
-            cf.params
+             WHERE 1=1 ${cf.clause}${excludeRoles}${statusClause}${searchClause} ORDER BY u.created_at DESC`,
+            queryParams
         );
         return successResponse(res, rows);
     } catch (err) {
@@ -101,10 +120,11 @@ exports.create = async (req, res) => {
         const isSuperAdmin = ['super_admin', 'superadmin'].includes(normalizedRole);
         const requestedCompanyId = normalizeCompanyId(company_id ?? body.companyId);
         const scopedCompanyId = normalizeCompanyId(req.companyScope);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        let assignedCompany = isSuperAdmin ? requestedCompanyId : (scopedCompanyId || requestedCompanyId);
 
-        // Super admin can create HQ users (NULL company_id) or tenant users (valid company_id).
-        // Tenant admins are always scoped to their own company.
-        const assignedCompany = isSuperAdmin ? requestedCompanyId : (scopedCompanyId || requestedCompanyId);
+        // If it's HQ (ID 1), we use NULL to satisfy foreign key constraints if ID 1 doesn't exist in companies table
+        if (assignedCompany == 1) assignedCompany = null;
 
         if (assignedCompany != null) {
             const [companyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [assignedCompany]);
@@ -195,7 +215,7 @@ exports.update = async (req, res) => {
         }
 
         const allowedColumns = [
-            'name', 'phone', 'role', 'company_id', 'employment_status',
+            'name', 'email', 'phone', 'role', 'company_id', 'employment_status',
             'is_available', 'status', 'joined_date', 'profile_pic_url', 'password',
             'birthday', 'bank_name', 'account_number', 'routing_number',
             'nib_number', 'vacation_balance'
@@ -206,7 +226,7 @@ exports.update = async (req, res) => {
 
         for (const [key, val] of Object.entries(body)) {
             if (!allowedColumns.includes(key)) continue;
-            if (['id', 'created_at', 'email'].includes(key)) continue;
+            if (['id', 'created_at'].includes(key)) continue;
 
             if (key === 'password') {
                 if (val && String(val).length >= 6) {
@@ -221,10 +241,31 @@ exports.update = async (req, res) => {
 
         if (sets.length === 0) return errorResponse(res, 'No fields to update.', 400);
 
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
+
         values.push(req.params.id, ...cs.params);
         await db.query(`UPDATE users SET ${sets.join(', ')} WHERE id = ?${cs.clause}`, values);
-        return successResponse(res, { id: req.params.id }, 'User updated.');
+        const [updatedRows] = await db.query(
+            `SELECT u.id, u.company_id, u.name, u.email, u.phone, u.role,
+                    u.is_available, u.employment_status, u.status, u.joined_date,
+                    u.profile_pic_url, u.birthday, u.bank_name, u.account_number,
+                    u.routing_number, u.nib_number, u.vacation_balance,
+                    u.passport_url, u.license_url, u.nib_doc_url, u.police_record_url,
+                    u.business_license_url, c.name as company_name, c.client_type, c.tenant_type
+             FROM users u LEFT JOIN companies c ON u.company_id = c.id
+             WHERE u.id = ?${cs.clause} LIMIT 1`,
+            [req.params.id, ...cs.params]
+        );
+        return successResponse(res, updatedRows[0] || { id: req.params.id }, 'User updated.');
     } catch (err) {
         console.error('Update user failed:', err.message);
         return errorResponse(res, `Failed to update user: ${err.message}`, 500);
@@ -234,7 +275,17 @@ exports.update = async (req, res) => {
 // DELETE /api/users/:id
 exports.remove = async (req, res) => {
     try {
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
+
         await db.query(`DELETE FROM users WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
         return successResponse(res, null, 'User deleted.');
     } catch (err) {
@@ -249,7 +300,17 @@ exports.review = async (req, res) => {
         if (!['active', 'rejected'].includes(status)) {
             return errorResponse(res, 'Status must be "active" or "rejected".', 400);
         }
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
+
         await db.query(
             `UPDATE users SET status = ? WHERE id = ?${cs.clause}`,
             [status, req.params.id, ...cs.params]

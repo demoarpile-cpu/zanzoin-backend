@@ -9,8 +9,11 @@ const requireRole = (...allowedRoles) => {
             return next();
         }
 
-        const normalizedUser = String(req.user.role || '').toLowerCase();
-        const effectiveRole = normalizedUser === 'operations' ? 'operation' : normalizedUser;
+        const normalizedUser = String(req.user.role || '').toLowerCase().trim().replace(/\s+/g, '_');
+        let effectiveRole = normalizedUser === 'operations' ? 'operation' : normalizedUser;
+        // New tenant-facing aliases
+        if (effectiveRole === 'business_client' || effectiveRole === 'client') effectiveRole = 'client';
+        if (effectiveRole === 'saas_client') effectiveRole = 'admin';
 
         const allowed = allowedRoles.some((a) => effectiveRole === String(a).toLowerCase());
         if (!allowed) {

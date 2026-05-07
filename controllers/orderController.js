@@ -9,20 +9,17 @@ const VALID_ORDER_STATUSES = ['created', 'admin_review', 'operation', 'procureme
 function orderMutationScope(req) {
     const roleNorm = String(req.user.role || '').toLowerCase().replace(/\s+/g, '');
     if (roleNorm === 'super_admin' || roleNorm === 'superadmin') return { clause: '', params: [] };
-    if (!req.companyScope) return { clause: '', params: [] };
+    
     const hqId = parseInt(process.env.DEFAULT_COMPANY_ID || 1, 10);
+    const isHQUser = (req.user.company_id == hqId || !req.user.company_id || req.companyScope == hqId);
+
+    // Treat HQ staff (Admin, Operations, Logistics) as platform-level managers who can see everything
+    if (isHQUser && ['admin', 'operation', 'operations', 'logistics', 'procurement', 'inventory'].includes(roleNorm)) {
+        return { clause: '', params: [] };
+    }
+
+    if (!req.companyScope) return { clause: '', params: [] };
     const role = roleNorm;
-    if (role === 'admin') {
-        return { clause: ' AND (company_id = ? OR company_id = ?)', params: [req.companyScope, hqId] };
-    }
-    // Match GET /orders: tenant ops/logistics may update rows on HQ when they are in fulfilment stages.
-    if (role === 'operation' || role === 'operations' || role === 'logistics') {
-        return {
-            clause:
-                ' AND (company_id = ? OR (company_id = ? AND (current_stage IN (\'operation\',\'logistics\') OR status IN (\'operation\',\'logistics\'))))',
-            params: [req.companyScope, hqId],
-        };
-    }
     return companyScope(req);
 }
 
@@ -58,6 +55,91 @@ function normalizeOrderStatus(input) {
     return null;
 }
 
+function normalizePositiveInt(val) {
+    if (val == null || val === '') return null;
+    const n = Number(val);
+    if (!Number.isFinite(n) || Number.isNaN(n) || n <= 0) return null;
+    return Math.trunc(n);
+}
+
+async function resolveReadableCompanyScope(req) {
+    const roleNorm = String(req.user?.role || '').toLowerCase().trim().replace(/\s+/g, '_');
+    if (roleNorm === 'super_admin' || roleNorm === 'superadmin') return null;
+
+    let companyId =
+        normalizePositiveInt(req.companyScope) ||
+        normalizePositiveInt(req.user?.company_id) ||
+        normalizePositiveInt(process.env.DEFAULT_COMPANY_ID || 1);
+
+    if (companyId) {
+        const [companyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [companyId]);
+        if (!companyRows.length) companyId = null;
+    }
+    if (!companyId) {
+        const [anyCompany] = await db.query('SELECT id FROM companies ORDER BY id ASC LIMIT 1');
+        if (anyCompany.length) companyId = anyCompany[0].id;
+    }
+    return companyId || null;
+}
+
+async function resolveValidCompanyId({ requestedCompanyId, scopedCompanyId, fallbackCompanyId }) {
+    let companyId = requestedCompanyId || scopedCompanyId || fallbackCompanyId;
+    if (!companyId) return null;
+
+    let [companyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [companyId]);
+
+    if (!companyRows.length && requestedCompanyId) {
+        // Frontend can accidentally send user/customer ids where company_id is expected.
+        const [userRows] = await db.query('SELECT company_id FROM users WHERE id = ? LIMIT 1', [requestedCompanyId]);
+        const userCompanyId = normalizePositiveInt(userRows?.[0]?.company_id);
+        if (userCompanyId) {
+            const [resolvedCompanyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [userCompanyId]);
+            if (resolvedCompanyRows.length) {
+                companyId = userCompanyId;
+                companyRows = resolvedCompanyRows;
+            }
+        }
+    }
+
+    if (!companyRows.length && requestedCompanyId) {
+        const [customerRows] = await db.query('SELECT company_id FROM customers WHERE id = ? LIMIT 1', [requestedCompanyId]);
+        const customerCompanyId = normalizePositiveInt(customerRows?.[0]?.company_id);
+        if (customerCompanyId) {
+            const [resolvedCompanyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [customerCompanyId]);
+            if (resolvedCompanyRows.length) {
+                companyId = customerCompanyId;
+                companyRows = resolvedCompanyRows;
+            }
+        }
+    }
+
+    if (!companyRows.length && scopedCompanyId) {
+        const [scopedRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [scopedCompanyId]);
+        if (scopedRows.length) {
+            companyId = scopedCompanyId;
+            companyRows = scopedRows;
+        }
+    }
+
+    if (!companyRows.length && fallbackCompanyId) {
+        const [fallbackRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [fallbackCompanyId]);
+        if (fallbackRows.length) {
+            companyId = fallbackCompanyId;
+            companyRows = fallbackRows;
+        }
+    }
+
+    if (!companyRows.length) {
+        const [anyCompany] = await db.query('SELECT id FROM companies ORDER BY id ASC LIMIT 1');
+        if (anyCompany.length) {
+            companyId = anyCompany[0].id;
+            companyRows = anyCompany;
+        }
+    }
+
+    return companyRows.length ? companyId : null;
+}
+
 // GET /api/orders
 exports.getAll = async (req, res) => {
     try {
@@ -65,11 +147,14 @@ exports.getAll = async (req, res) => {
         if (role === 'superadmin') role = 'super_admin';
         // JWT / UI historically used plural "operations"; DB stage is singular "operation"
         if (role === 'operations') role = 'operation';
+        const effectiveCompanyScope = await resolveReadableCompanyScope(req);
         let whereClause = 'WHERE 1=1';
         const params = [];
 
         // Super admin sees everything (no tenant filter)
-        if (role === 'super_admin') {
+        // Super admin or HQ Admin sees everything (no tenant filter)
+        const isHQ = (req.user.company_id == 1 || !req.user.company_id || req.companyScope == 1);
+        if (role === 'super_admin' || (role === 'admin' && isHQ)) {
             // no additional filter
         }
         // Customer sees only their own orders (by email or created_by)
@@ -79,21 +164,21 @@ exports.getAll = async (req, res) => {
         }
         // Tenant-scoped roles (admin, operation, logistics, etc.) see their company.
         // Admins also see DEFAULT_COMPANY_ID (HQ) orders so personal/marketplace checkout is visible alongside tenant work.
-        else if (req.companyScope) {
+        else if (effectiveCompanyScope) {
             const hqId = parseInt(process.env.DEFAULT_COMPANY_ID || 1, 10);
             if (role === 'admin') {
                 whereClause += ' AND (o.company_id = ? OR o.company_id = ?)';
-                params.push(req.companyScope, hqId);
+                params.push(effectiveCompanyScope, hqId);
             } else if (role === 'operation' || role === 'logistics') {
                 // Marketplace / personal checkout is stored on HQ (DEFAULT_COMPANY_ID). Tenant operations &
                 // logistics users must still see that fulfilment queue; otherwise lists look "empty" while
                 // notifications say a new order exists.
                 whereClause +=
                     ' AND (o.company_id = ? OR (o.company_id = ? AND (o.current_stage IN (\'operation\',\'logistics\') OR o.status IN (\'operation\',\'logistics\'))))';
-                params.push(req.companyScope, hqId);
+                params.push(effectiveCompanyScope, hqId);
             } else {
                 whereClause += ' AND o.company_id = ?';
-                params.push(req.companyScope);
+                params.push(effectiveCompanyScope);
             }
 
             // Operational staff sees only orders assigned to them or at their stage
@@ -194,12 +279,25 @@ exports.create = async (req, res) => {
             custom_request_category,
             concierge_member
         } = req.body;
-        let companyId = req.body.company_id || req.companyScope;
-        const hqCompanyId = parseInt(process.env.DEFAULT_COMPANY_ID || 1, 10);
+        const hqCompanyId = normalizePositiveInt(process.env.DEFAULT_COMPANY_ID || 1);
+        const roleNorm = String(req.user?.role || '').toLowerCase().trim().replace(/\s+/g, '_');
+        const rawRequestedCompanyId = normalizePositiveInt(req.body.company_id || req.body.companyId);
+        const scopedCompanyId = normalizePositiveInt(req.companyScope);
+        // Tenant users should create orders inside their own workspace by default.
+        // This prevents "POST success but GET empty" when frontend accidentally sends customer/user IDs as company_id.
+        const requestedCompanyId =
+            roleNorm !== 'super_admin' && roleNorm !== 'customer'
+                ? (scopedCompanyId || rawRequestedCompanyId)
+                : rawRequestedCompanyId;
+        let companyId = requestedCompanyId || scopedCompanyId || hqCompanyId;
 
         // Personal (customer) checkout always lands on HQ company — ignores mistaken client company_id so admin + logistics queues stay consistent.
         if (req.user.role === 'customer') {
-            companyId = hqCompanyId;
+            companyId = await resolveValidCompanyId({
+                requestedCompanyId: hqCompanyId,
+                scopedCompanyId,
+                fallbackCompanyId: hqCompanyId
+            });
         } else if (!companyId) {
             return errorResponse(res, 'Company ID required.', 400);
         }
@@ -273,9 +371,12 @@ exports.create = async (req, res) => {
         // delivery_address: accept from body or fall back to location field
         const finalDeliveryAddress = delivery_address || location || null;
 
-        // company_id must exist (FK)
-        const [companyRows] = await db.query('SELECT id FROM companies WHERE id = ?', [companyId]);
-        if (companyRows.length === 0) {
+        companyId = await resolveValidCompanyId({
+            requestedCompanyId,
+            scopedCompanyId,
+            fallbackCompanyId: hqCompanyId
+        });
+        if (!companyId) {
             return errorResponse(res, 'Invalid company_id: no matching company. Seed a company or fix company_id.', 400);
         }
 
@@ -401,6 +502,19 @@ exports.update = async (req, res) => {
             // Convert empty strings to null for foreign key fields
             const cleanVal = (fkFields.includes(key) && (val === '' || val === undefined)) ? null : val;
             const dbKey = key === 'client_id' ? 'customer_id' : key;
+            if (dbKey === 'company_id' && cleanVal != null) {
+                const resolvedCompanyId = await resolveValidCompanyId({
+                    requestedCompanyId: normalizePositiveInt(cleanVal),
+                    scopedCompanyId: normalizePositiveInt(req.companyScope),
+                    fallbackCompanyId: normalizePositiveInt(process.env.DEFAULT_COMPANY_ID || 1)
+                });
+                if (!resolvedCompanyId) {
+                    return errorResponse(res, 'Invalid company_id: no matching company.', 400);
+                }
+                sets.push(`${dbKey} = ?`);
+                values.push(resolvedCompanyId);
+                continue;
+            }
             sets.push(`${dbKey} = ?`);
             values.push(key === 'items' ? JSON.stringify(cleanVal) : cleanVal);
         }
@@ -572,7 +686,7 @@ exports.convertToProject = async (req, res) => {
     try {
         const { orderId } = req.params;
         const { name, description, location } = req.body;
-        
+
         // Handle both snake_case and camelCase from frontend
         const managerId = req.body.manager_id || req.body.managerId || req.user.id;
         const startDate = req.body.start_date || req.body.startDate || req.body.start || null;
@@ -602,7 +716,10 @@ exports.convertToProject = async (req, res) => {
 
         // Get project with joins (Note: table is companies if exists, else it might have been clients)
         const [projects] = await db.query(
-            `SELECT p.*, c.name as client_name FROM projects p LEFT JOIN companies c ON p.company_id = c.id WHERE p.id = ?`,
+            `SELECT p.*, COALESCE(c.name, cu.name) as client_name FROM projects p 
+             LEFT JOIN companies c ON p.company_id = c.id 
+             LEFT JOIN customers cu ON p.company_id = cu.id
+             WHERE p.id = ?`,
             [result.insertId]
         );
 
@@ -619,11 +736,23 @@ exports.convertToProject = async (req, res) => {
 // GET /api/orders/projects/all
 exports.getAllProjects = async (req, res) => {
     try {
-        const cf = companyFilter(req, 'p');
+        const role = req.user.role;
+        const isHQ = (req.user.company_id == 1 || !req.user.company_id || req.companyScope == 1);
+        
+        let cf;
+        if (role === 'super_admin' || (role === 'admin' && isHQ)) {
+            cf = { clause: '', params: [] };
+        } else {
+            cf = companyFilter(req, 'p');
+        }
+
         const [rows] = await db.query(
-            `SELECT p.*, c.name as client_name, u.name as manager_name
+            `SELECT p.*, 
+                    COALESCE(c.name, cu.name) as client_name, 
+                    u.name as manager_name
              FROM projects p
              LEFT JOIN companies c ON p.company_id = c.id
+             LEFT JOIN customers cu ON p.company_id = cu.id
              LEFT JOIN users u ON p.manager_id = u.id
              WHERE 1=1 ${cf.clause} ORDER BY p.created_at DESC`,
             cf.params
@@ -729,7 +858,7 @@ exports.createProject = async (req, res) => {
             [companyId, String(name).trim(), description || null, managerId || null, location || null, projectStatus, startDateVal || null]
         );
 
-        const [projects] = await db.query(`SELECT p.*, c.name as client_name FROM projects p LEFT JOIN companies c ON p.company_id = c.id WHERE p.id = ?`, [result.insertId]);
+        const [projects] = await db.query(`SELECT p.*, COALESCE(c.name, cu.name) as client_name FROM projects p LEFT JOIN companies c ON p.company_id = c.id LEFT JOIN customers cu ON p.company_id = cu.id WHERE p.id = ?`, [result.insertId]);
         return successResponse(res, projects[0] || { id: result.insertId }, 'Project created.', 201);
     } catch (err) {
         console.error('Create project error:', err);
@@ -741,7 +870,16 @@ exports.createProject = async (req, res) => {
 exports.updateProject = async (req, res) => {
     try {
         const { name, description, status, location, start_date, manager_id } = req.body;
-        const cs = companyScope(req);
+        const role = req.user.role;
+        const isHQ = (req.user.company_id == 1 || !req.user.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (role === 'super_admin' || (role === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
+
         await db.query(
             `UPDATE projects SET name = COALESCE(?, name), description = COALESCE(?, description), status = COALESCE(?, status), location = COALESCE(?, location), start_date = COALESCE(?, start_date), manager_id = COALESCE(?, manager_id) WHERE id = ?${cs.clause}`,
             [name, description, status, location, start_date, manager_id, req.params.id, ...cs.params]
@@ -755,7 +893,16 @@ exports.updateProject = async (req, res) => {
 // DELETE /api/orders/projects/:id
 exports.deleteProject = async (req, res) => {
     try {
-        const cs = companyScope(req);
+        const role = req.user.role;
+        const isHQ = (req.user.company_id == 1 || !req.user.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (role === 'super_admin' || (role === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
+
         await db.query(`DELETE FROM projects WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
         return successResponse(res, null, 'Project deleted.');
     } catch (err) {

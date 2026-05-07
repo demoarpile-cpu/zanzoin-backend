@@ -6,7 +6,16 @@ const { createNotification } = require('./notificationController');
 // --- TICKETS ---
 exports.getTickets = async (req, res) => {
     try {
-        const cf = companyFilter(req, 'st');
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cf;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cf = { clause: '', params: [] };
+        } else {
+            cf = companyFilter(req, 'st');
+        }
         const [rows] = await db.query(`SELECT st.*, u.name as submitted_by_name FROM support_tickets st LEFT JOIN users u ON st.submitted_by = u.id WHERE 1=1 ${cf.clause} ORDER BY st.created_at DESC`, cf.params);
         return successResponse(res, rows);
     } catch (err) { return errorResponse(res, 'Failed to fetch tickets.', 500); }
@@ -58,7 +67,16 @@ exports.updateTicketStatus = async (req, res) => {
 // --- EVENTS ---
 exports.getEvents = async (req, res) => {
     try {
-        const cf = companyFilter(req, 'e');
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cf;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cf = { clause: '', params: [] };
+        } else {
+            cf = companyFilter(req, 'e');
+        }
         const [rows] = await db.query(
             `SELECT e.*, COALESCE(c.name, comp.name) as client_name
              FROM events e
@@ -83,6 +101,10 @@ exports.createEvent = async (req, res) => {
     try {
         const { name, event_date, location, client_id, manager_id, status, special_requests, planner_name, guest_count } = req.body;
         let companyId = req.companyScope;
+        
+        // HQ Fix
+        if (companyId == 1) companyId = null;
+
         // For super_admin / admin: resolve company_id from client_id if provided
         if (!companyId && client_id) companyId = client_id;
 
@@ -115,7 +137,18 @@ exports.createEvent = async (req, res) => {
 exports.updateEvent = async (req, res) => {
     try {
         const { name, event_date, location, client_id, status, special_requests, planner_name, guest_count } = req.body;
-        const cs = companyScope(req);
+        
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
+
         const dbStatus = status ? normalizeEventStatus(status) : undefined;
         const imageUrl = req.file ? `/uploads/${req.file.filename}` : undefined;
 
@@ -135,7 +168,16 @@ exports.updateEvent = async (req, res) => {
 
 exports.deleteEvent = async (req, res) => {
     try {
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
         await db.query(`DELETE FROM events WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
         return successResponse(res, null, 'Event deleted.');
     } catch (err) { return errorResponse(res, 'Failed to delete event.', 500); }
@@ -144,7 +186,16 @@ exports.deleteEvent = async (req, res) => {
 // --- GUEST REQUESTS ---
 exports.getGuestRequests = async (req, res) => {
     try {
-        const cf = companyFilter(req, 'gr');
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cf;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cf = { clause: '', params: [] };
+        } else {
+            cf = companyFilter(req, 'gr');
+        }
         const [rows] = await db.query(
             `SELECT gr.*, c.name as client_name FROM guest_requests gr LEFT JOIN companies c ON gr.client_id = c.id WHERE 1=1 ${cf.clause} ORDER BY gr.created_at DESC`,
             cf.params
@@ -167,7 +218,11 @@ const normalizePriority = (p) => PRIORITY_MAP[(p || '').toLowerCase()] || 'mediu
 exports.createGuestRequest = async (req, res) => {
     try {
         const { client_id, guest, requested_by, request_details, delivery_time, priority, status } = req.body;
-        const companyId = req.companyScope;
+        let companyId = req.companyScope;
+        
+        // HQ Fix
+        if (companyId == 1) companyId = null;
+
         const dbPriority = normalizePriority(priority);
         const dbStatus = normalizeGuestStatus(status);
         const [result] = await db.query(
@@ -183,7 +238,17 @@ exports.createGuestRequest = async (req, res) => {
 exports.updateGuestRequest = async (req, res) => {
     try {
         const { guest, requested_by, request_details, delivery_time, priority, status } = req.body;
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
+
         const dbPriority = priority ? normalizePriority(priority) : undefined;
         // Customer can't change status - only admin/concierge can approve/reject
         const dbStatus = (status && req.user.role !== 'customer') ? normalizeGuestStatus(status) : undefined;
@@ -203,7 +268,16 @@ exports.updateGuestRequest = async (req, res) => {
 
 exports.deleteGuestRequest = async (req, res) => {
     try {
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
         await db.query(`DELETE FROM guest_requests WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
         return successResponse(res, null, 'Guest request deleted.');
     } catch (err) { return errorResponse(res, 'Failed to delete guest request.', 500); }
@@ -212,7 +286,16 @@ exports.deleteGuestRequest = async (req, res) => {
 // --- CHAUFFEUR REQUESTS ---
 exports.getChauffeurRequests = async (req, res) => {
     try {
-        const cf = companyFilter(req, 'd');
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cf;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cf = { clause: '', params: [] };
+        } else {
+            cf = companyFilter(req, 'd');
+        }
         const [rows] = await db.query(
             `SELECT d.*, c.name as clientName FROM deliveries d LEFT JOIN companies c ON d.company_id = c.id WHERE d.mission_type = 'Chauffeur' ${cf.clause} ORDER BY d.created_at DESC`,
             cf.params
@@ -224,7 +307,16 @@ exports.getChauffeurRequests = async (req, res) => {
 // --- AUDITS ---
 exports.getAudits = async (req, res) => {
     try {
-        const cf = companyFilter(req, 'al');
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cf;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cf = { clause: '', params: [] };
+        } else {
+            cf = companyFilter(req, 'al');
+        }
         const [rows] = await db.query(`SELECT al.*, u.name as performed_by_name FROM audit_logs al LEFT JOIN users u ON al.performed_by = u.id WHERE 1=1 ${cf.clause} ORDER BY al.created_at DESC`, cf.params);
         return successResponse(res, rows);
     } catch (err) { return errorResponse(res, 'Failed to fetch audits.', 500); }
@@ -233,7 +325,11 @@ exports.getAudits = async (req, res) => {
 exports.createAudit = async (req, res) => {
     try {
         const { title, type, description, status } = req.body;
-        const companyId = req.companyScope;
+        let companyId = req.companyScope;
+        
+        // HQ Fix
+        if (companyId == 1) companyId = null;
+
         const [result] = await db.query(
             `INSERT INTO audit_logs (company_id, title, type, description, status, performed_by) VALUES (?, ?, ?, ?, ?, ?)`,
             [companyId, title, type || null, description || null, status || 'pending', req.user.id]
@@ -245,7 +341,17 @@ exports.createAudit = async (req, res) => {
 exports.updateAudit = async (req, res) => {
     try {
         const { title, type, description, status } = req.body;
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
+
         await db.query(
             `UPDATE audit_logs SET title = COALESCE(?, title), type = COALESCE(?, type), description = COALESCE(?, description), status = COALESCE(?, status) WHERE id = ?${cs.clause}`,
             [title, type, description, status, req.params.id, ...cs.params]
@@ -256,7 +362,16 @@ exports.updateAudit = async (req, res) => {
 
 exports.deleteAudit = async (req, res) => {
     try {
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
         await db.query(`DELETE FROM audit_logs WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
         return successResponse(res, null, 'Audit deleted.');
     } catch (err) { return errorResponse(res, 'Failed to delete audit.', 500); }

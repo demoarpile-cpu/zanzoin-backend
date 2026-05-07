@@ -10,13 +10,50 @@ function clampPercentMetric(val) {
     return Math.min(100, Math.max(0, n));
 }
 
+function isSuperAdminRole(role) {
+    const r = String(role || '').trim().toLowerCase().replace(/\s+/g, '_');
+    return r === 'super_admin' || r === 'superadmin';
+}
+
 // GET /api/vendors
 exports.getAll = async (req, res) => {
     try {
-        const cf = companyFilter(req);
+        const normalizePositiveInt = (val) => {
+            if (val == null || val === '') return null;
+            const n = Number(val);
+            if (!Number.isFinite(n) || Number.isNaN(n) || n <= 0) return null;
+            return Math.trunc(n);
+        };
+
+        // Super admin sees all vendors across companies.
+        if (isSuperAdminRole(req.user?.role)) {
+            const [rows] = await db.query(
+                `SELECT *, location AS address FROM vendors ORDER BY created_at DESC`
+            );
+            return successResponse(res, rows);
+        }
+
+        // Keep tenant-scoped view, but recover when middleware scope points to non-existent company.
+        const fallbackCompanyId = normalizePositiveInt(process.env.DEFAULT_COMPANY_ID || 1);
+        let companyId =
+            normalizePositiveInt(req.companyScope) ||
+            normalizePositiveInt(req.user?.company_id) ||
+            fallbackCompanyId;
+
+        if (companyId) {
+            const [companyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [companyId]);
+            if (!companyRows.length) companyId = null;
+        }
+        if (!companyId) {
+            const [anyCompany] = await db.query('SELECT id FROM companies ORDER BY id ASC LIMIT 1');
+            if (anyCompany.length) companyId = anyCompany[0].id;
+        }
+
+        if (!companyId) return successResponse(res, []);
+
         const [rows] = await db.query(
-            `SELECT *, location AS address FROM vendors WHERE 1=1 ${cf.clause} ORDER BY created_at DESC`,
-            cf.params
+            `SELECT *, location AS address FROM vendors WHERE company_id = ? ORDER BY created_at DESC`,
+            [companyId]
         );
         return successResponse(res, rows);
     } catch (err) { return errorResponse(res, 'Failed to fetch vendors.', 500); }
@@ -75,10 +112,13 @@ exports.create = async (req, res) => {
 
         const ratingVal = clampPercentMetric(rating);
         const deliveryVal = clampPercentMetric(delivery);
+        // Approval flow: all new vendors start as pending (stored as inactive).
+        // Only super admin should later set them to active.
+        const safeStatus = 'inactive';
 
         const [result] = await db.query(
-            `INSERT INTO vendors (company_id, name, email, phone, contact_name, category, location, rating, delivery)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO vendors (company_id, name, email, phone, contact_name, category, location, rating, delivery, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 companyId,
                 String(name).trim(),
@@ -88,10 +128,11 @@ exports.create = async (req, res) => {
                 category || null,
                 location,
                 ratingVal,
-                deliveryVal
+                deliveryVal,
+                safeStatus
             ]
         );
-        return successResponse(res, { id: result.insertId, name: String(name).trim() }, 'Vendor created.', 201);
+        return successResponse(res, { id: result.insertId, name: String(name).trim(), status: safeStatus }, 'Vendor created.', 201);
     } catch (err) {
         console.error('Create vendor error:', err);
         return errorResponse(res, `Failed to create vendor. ${err.sqlMessage || err.message || ''}`.trim(), 500);
@@ -118,13 +159,39 @@ exports.update = async (req, res) => {
             if ((key === 'rating' || key === 'delivery') && v != null) {
                 v = clampPercentMetric(v);
             }
+            if (key === 'status') {
+                const statusNorm = String(v || '').toLowerCase().trim();
+                if (!isSuperAdminRole(req.user?.role)) {
+                    // Tenant admins/procurement cannot self-approve vendors.
+                    if (statusNorm === 'active' || statusNorm === 'blacklisted') {
+                        return errorResponse(res, 'Only super admin can approve or blacklist vendors.', 403);
+                    }
+                    // Keep non-super-admin updates in pending state.
+                    v = 'inactive';
+                } else {
+                    if (!['active', 'inactive', 'blacklisted'].includes(statusNorm)) {
+                        return errorResponse(res, 'Invalid vendor status.', 400);
+                    }
+                    v = statusNorm;
+                }
+            }
             sets.push(`${key} = ?`);
             values.push(v);
         }
 
         if (sets.length === 0) return errorResponse(res, 'No valid fields to update.', 400);
+        
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
 
-        const cs = companyScope(req);
         values.push(req.params.id, ...cs.params);
         await db.query(`UPDATE vendors SET ${sets.join(', ')} WHERE id = ?${cs.clause}`, values);
         return successResponse(res, { id: req.params.id }, 'Vendor updated.');
@@ -137,7 +204,16 @@ exports.update = async (req, res) => {
 // DELETE /api/vendors/:id
 exports.remove = async (req, res) => {
     try {
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
         await db.query(`DELETE FROM vendors WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
         return successResponse(res, null, 'Vendor deleted.');
     } catch (err) { return errorResponse(res, 'Failed to delete vendor.', 500); }

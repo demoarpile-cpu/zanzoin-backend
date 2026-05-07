@@ -3,10 +3,33 @@ const { companyFilter, companyScope } = require('../middleware/company');
 const { successResponse, errorResponse } = require('../utils/helpers');
 const { createNotification } = require('./notificationController');
 
+function normalizePositiveInt(val) {
+    if (val == null || val === '') return null;
+    const n = Number(val);
+    if (!Number.isFinite(n) || Number.isNaN(n) || n <= 0) return null;
+    return Math.trunc(n);
+}
+
+async function resolveValidCompanyId(candidateId) {
+    const normalized = normalizePositiveInt(candidateId);
+    if (!normalized) return null;
+    const [rows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [normalized]);
+    return rows.length ? normalized : null;
+}
+
 // --- VEHICLES ---
 exports.getVehicles = async (req, res) => {
     try {
-        const cf = companyFilter(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().trim().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cf;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cf = { clause: '', params: [] };
+        } else {
+            cf = companyFilter(req);
+        }
         const [rows] = await db.query(`SELECT * FROM vehicles WHERE 1=1 ${cf.clause} ORDER BY created_at DESC`, cf.params);
         return successResponse(res, rows);
     } catch (err) { return errorResponse(res, 'Failed to fetch vehicles.', 500); }
@@ -15,7 +38,7 @@ exports.getVehicles = async (req, res) => {
 exports.createVehicle = async (req, res) => {
     try {
         const { plate_number, model, type, vehicle_type, capacity, fuel_level, insurance_policy, registration_expiry, inspection_date, diagnostic_status } = req.body;
-        const companyId = req.companyScope;
+        let companyId = await resolveValidCompanyId(req.companyScope);
         const [result] = await db.query(
             `INSERT INTO vehicles (company_id, plate_number, model, type, vehicle_type, capacity, fuel_level, insurance_policy, registration_expiry, inspection_date, diagnostic_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [companyId, plate_number, model || null, type || null, vehicle_type || 'Car', capacity || null, fuel_level || 100, insurance_policy || null, registration_expiry || null, inspection_date || null, diagnostic_status || null]
@@ -32,7 +55,18 @@ exports.updateVehicle = async (req, res) => {
             if (['id', 'created_at', 'company_id'].includes(k)) continue;
             sets.push(`${k} = ?`); values.push(v);
         }
-        const cs = companyScope(req);
+        
+        const roleNorm = String(req.user?.role || '').toLowerCase().trim().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
+
         values.push(req.params.id, ...cs.params);
         await db.query(`UPDATE vehicles SET ${sets.join(', ')} WHERE id = ?${cs.clause}`, values);
         return successResponse(res, { id: req.params.id }, 'Vehicle updated.');
@@ -41,7 +75,17 @@ exports.updateVehicle = async (req, res) => {
 
 exports.deleteVehicle = async (req, res) => {
     try {
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().trim().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
+
         await db.query(`DELETE FROM vehicles WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
         return successResponse(res, null, 'Vehicle deleted.');
     } catch (err) { return errorResponse(res, 'Failed to delete vehicle.', 500); }
@@ -50,8 +94,34 @@ exports.deleteVehicle = async (req, res) => {
 // --- DELIVERIES ---
 exports.getDeliveries = async (req, res) => {
     try {
-        const cf = companyFilter(req, 'd');
-        const [rows] = await db.query(`SELECT d.*, v.plate_number as vehicle_plate FROM deliveries d LEFT JOIN vehicles v ON d.vehicle_id = v.id WHERE 1=1 ${cf.clause} ORDER BY d.created_at DESC`, cf.params);
+        const roleNorm = String(req.user?.role || '').toLowerCase().trim().replace(/\s+/g, '_');
+        if (roleNorm === 'super_admin' || roleNorm === 'superadmin') {
+            const [rows] = await db.query(
+                `SELECT d.*, v.plate_number as vehicle_plate
+                 FROM deliveries d
+                 LEFT JOIN vehicles v ON d.vehicle_id = v.id
+                 ORDER BY d.created_at DESC`
+            );
+            return successResponse(res, rows);
+        }
+
+        let companyId = await resolveValidCompanyId(req.companyScope);
+        if (!companyId) companyId = await resolveValidCompanyId(req.user?.company_id);
+        if (!companyId) companyId = await resolveValidCompanyId(process.env.DEFAULT_COMPANY_ID || 1);
+        if (!companyId) {
+            const [anyCompany] = await db.query('SELECT id FROM companies ORDER BY id ASC LIMIT 1');
+            if (anyCompany.length) companyId = anyCompany[0].id;
+        }
+        if (!companyId) return successResponse(res, []);
+
+        const [rows] = await db.query(
+            `SELECT d.*, v.plate_number as vehicle_plate
+             FROM deliveries d
+             LEFT JOIN vehicles v ON d.vehicle_id = v.id
+             WHERE d.company_id = ?
+             ORDER BY d.created_at DESC`,
+            [companyId]
+        );
         return successResponse(res, rows);
     } catch (err) { return errorResponse(res, 'Failed to fetch deliveries.', 500); }
 };
@@ -60,16 +130,25 @@ exports.createDelivery = async (req, res) => {
     try {
         const { order_id, route, driver_name, plate_number, package_details, status, mission_type, pickup_location, drop_location, passenger_info, delivery_date, pickup_time } = req.body;
         // For super_admin: resolve company_id from request body or from the order
-        let companyId = req.companyScope;
-        if (!companyId && req.body.company_id) {
-            companyId = req.body.company_id;
-        }
+        let companyId = await resolveValidCompanyId(req.companyScope);
+        if (!companyId) companyId = await resolveValidCompanyId(req.body.company_id);
         if (!companyId && order_id) {
             const safeOid = order_id && !isNaN(Number(order_id)) ? Number(order_id) : null;
             if (safeOid) {
                 const [orderRows] = await db.query('SELECT company_id FROM orders WHERE id = ?', [safeOid]);
-                if (orderRows.length > 0) companyId = orderRows[0].company_id;
+                if (orderRows.length > 0) {
+                    companyId = await resolveValidCompanyId(orderRows[0].company_id);
+                }
             }
+        }
+        if (!companyId) companyId = await resolveValidCompanyId(req.user?.company_id);
+        if (!companyId) companyId = await resolveValidCompanyId(process.env.DEFAULT_COMPANY_ID || 1);
+        if (!companyId) {
+            const [anyCompany] = await db.query('SELECT id FROM companies ORDER BY id ASC LIMIT 1');
+            if (anyCompany.length) companyId = anyCompany[0].id;
+        }
+        if (!companyId) {
+            return errorResponse(res, 'No valid company mapping found for delivery.', 400);
         }
 
         // Sanitize order_id - must be valid integer or null (foreign key constraint)
@@ -187,7 +266,7 @@ exports.getRoutes = async (req, res) => {
 exports.createRoute = async (req, res) => {
     try {
         const { name, start_location, end_location, distance_km, estimated_time } = req.body;
-        const companyId = req.companyScope;
+        let companyId = await resolveValidCompanyId(req.companyScope);
         const [result] = await db.query(
             `INSERT INTO routes (company_id, name, start_location, end_location, distance_km, estimated_time) VALUES (?, ?, ?, ?, ?, ?)`,
             [companyId, name, start_location || '', end_location || '', distance_km || 0, estimated_time || null]
@@ -246,7 +325,7 @@ exports.getTracking = async (req, res) => {
 exports.createTracking = async (req, res) => {
     try {
         const { tracker_id, asset, location, signal, eta, status, delivery_id } = req.body;
-        const companyId = req.companyScope;
+        let companyId = await resolveValidCompanyId(req.companyScope);
         const [result] = await db.query(
             `INSERT INTO logistics_tracking (company_id, tracker_id, asset, location, signal_strength, eta, status, delivery_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
             [companyId, tracker_id || null, asset || null, location || null, signal || 'Strong', eta || null, status || 'Active', delivery_id || null]
@@ -287,7 +366,7 @@ exports.getUrgentTasks = async (req, res) => {
 exports.createUrgentTask = async (req, res) => {
     try {
         const { task, time, priority, location, assignee } = req.body;
-        const companyId = req.companyScope;
+        let companyId = await resolveValidCompanyId(req.companyScope);
         const [result] = await db.query(
             `INSERT INTO logistics_urgent_tasks (company_id, task, time_label, priority, location, assignee) VALUES (?, ?, ?, ?, ?, ?)`,
             [companyId, task || 'Urgent Mission', time || 'Immediate', priority || 'Critical', location || null, assignee || 'Pending']

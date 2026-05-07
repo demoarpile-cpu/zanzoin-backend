@@ -5,9 +5,40 @@ const { generatePassword, successResponse, errorResponse } = require('../utils/h
 const { createNotification } = require('./notificationController');
 const { sendMail } = require('../utils/mailer');
 
-function isSuperAdminRole(role) {
-    const r = String(role || '').trim().toLowerCase();
-    return r === 'super_admin' || r === 'superadmin' || r === 'super admin';
+function isSuperAdminRole(user) {
+    if (!user) return false;
+    const r = String(user.role || '').trim().toLowerCase();
+    const isSA = r === 'super_admin' || r === 'superadmin' || r === 'super admin';
+    // Treat admin of HQ (company_id 1) as a platform admin with super powers
+    const isHQAdmin = r === 'admin' && (user.company_id === 1 || !user.company_id);
+    return isSA || isHQAdmin;
+}
+
+async function getAllowedUserRoles() {
+    const [rows] = await db.query(
+        `SELECT COLUMN_TYPE
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'users'
+           AND COLUMN_NAME = 'role'
+         LIMIT 1`
+    );
+    const colType = String(rows?.[0]?.COLUMN_TYPE || '');
+    const matches = [...colType.matchAll(/'([^']+)'/g)];
+    return new Set(matches.map((m) => String(m[1] || '').toLowerCase()));
+}
+
+function resolveRoleForStorage(logicalRole, allowedRoles) {
+    const role = String(logicalRole || '').toLowerCase();
+    const aliases = {
+        business_client: ['business_client', 'business client', 'client'],
+        saas_client: ['saas_client', 'saas client', 'admin'],
+        super_admin: ['super_admin', 'superadmin', 'super admin'],
+        customer: ['customer', 'client']
+    };
+    const candidates = aliases[role] || [role];
+    const match = candidates.find((c) => allowedRoles.has(c));
+    return match || logicalRole;
 }
 
 // GET /api/customers (aliased as /api/clients)
@@ -15,11 +46,12 @@ exports.getAll = async (req, res) => {
     try {
         const role = req.user.role;
 
-        // Super Admin → sees companies, filtered by client_type if provided
-        if (isSuperAdminRole(role)) {
-            const clientType = req.query.client_type;
-            
-            // Special handling for Personal clients stored as SaaS + tagline metadata
+        // Super Admin / HQ Admin → Decide between Companies list or Customers list
+        const isSuperAdmin = isSuperAdminRole(req.user);
+        const clientType = req.query.client_type;
+
+        if (isSuperAdmin && (clientType === 'SaaS' || clientType === 'Business' || !clientType)) {
+            // Show Platform Clients (Companies) 
             let query = `SELECT c.*,
                     (SELECT COUNT(*) FROM users u WHERE u.company_id = c.id) as total_users,
                     (SELECT COUNT(*) FROM customers cu WHERE cu.company_id = c.id) as total_customers,
@@ -43,6 +75,12 @@ exports.getAll = async (req, res) => {
 
             query += ` ORDER BY c.created_at DESC`;
             const [rows] = await db.query(query, queryParams);
+            return successResponse(res, rows);
+        }
+
+        // If Super Admin/HQ Admin is looking for Personal Customers, show ALL customers from all companies
+        if (isSuperAdmin && (clientType === 'Personal' || clientType === 'Direct' || clientType === 'Customers')) {
+            const [rows] = await db.query(`SELECT * FROM customers ORDER BY created_at DESC`);
             return successResponse(res, rows);
         }
 
@@ -95,7 +133,7 @@ exports.getById = async (req, res) => {
         const isSuperAdmin = isSuperAdminRole(req.user.role);
         const table = isSuperAdmin ? 'companies' : 'customers';
         const cs = companyScope(req);
-        
+
         const queryParams = isSuperAdmin ? [req.params.id] : [req.params.id, ...cs.params];
         const [rows] = await db.query(`SELECT * FROM ${table} WHERE id = ?${isSuperAdmin ? '' : cs.clause}`, queryParams);
         if (rows.length === 0) return errorResponse(res, 'Client not found.', 404);
@@ -109,8 +147,8 @@ exports.getById = async (req, res) => {
 exports.create = async (req, res) => {
     try {
         const { name, email, phone, contact, address, client_type, password,
-                billing_cycle, payment_method, contact_person, business_name,
-                logo_url, source, status, plan, location } = req.body;
+            billing_cycle, payment_method, contact_person, business_name,
+            logo_url, source, status, plan, location } = req.body;
 
         const role = req.user.role;
 
@@ -120,25 +158,62 @@ exports.create = async (req, res) => {
             if (existingUser.length > 0) {
                 return errorResponse(res, 'This email is already registered in the system.', 400);
             }
-            
-            // Also check companies/customers just in case (for records without users)
-            const [existingCompany] = await db.query('SELECT id FROM companies WHERE email = ?', [email]);
+
+            // Recovery path: if prior create failed midway (company created but user insert failed),
+            // reuse that company instead of hard-failing on duplicate email in companies table.
+            if (isSuperAdminRole(role)) {
+                const [existingCompany] = await db.query(
+                    'SELECT id, name FROM companies WHERE email = ? ORDER BY id DESC LIMIT 1',
+                    [email]
+                );
+                if (existingCompany.length > 0) {
+                    const companyId = existingCompany[0].id;
+                    const allowedRoles = await getAllowedUserRoles();
+                    const userPassword = password || generatePassword();
+                    const hashedPassword = await bcrypt.hash(userPassword, 12);
+                    const typeNorm = String(client_type || '').toLowerCase();
+                    let userRole = 'saas_client';
+                    if (client_type === 'Personal' || plan === 'Free') userRole = 'customer';
+                    else if (typeNorm === 'business') userRole = 'business_client';
+                    else if (typeNorm === 'saas') userRole = 'saas_client';
+                    const storedRole = resolveRoleForStorage(userRole, allowedRoles);
+
+                    await db.query(
+                        `INSERT INTO users (company_id, name, email, password, phone, role, status) VALUES (?, ?, ?, ?, ?, ?, 'active')`,
+                        [companyId, name, email, hashedPassword, phone || null, storedRole]
+                    );
+
+                    sendMail(email, 'Welcome to ZaneZion',
+                        `<h2>Your ZaneZion ${storedRole === 'customer' ? 'Personal' : 'Institutional'} account is ready!</h2>
+                         <p>Email: <strong>${email}</strong></p>
+                         <p>Password: <strong>${userPassword}</strong></p>`
+                    ).catch(e => console.log('Recovery welcome email failed:', e.message));
+
+                    return successResponse(res, {
+                        id: companyId,
+                        name: existingCompany[0].name || business_name || name,
+                        credentials: { email, password: userPassword, message: `Existing client recovered and login credentials sent to ${email}` }
+                    }, 'Existing client record recovered and login created.', 201);
+                }
+            }
+
             const [existingCust] = await db.query('SELECT id FROM customers WHERE email = ?', [email]);
-            if (existingCompany.length > 0 || existingCust.length > 0) {
+            if (existingCust.length > 0) {
                 return errorResponse(res, 'This email is already associated with an existing client/customer record.', 400);
             }
         }
         if (isSuperAdminRole(role)) {
+            const allowedRoles = await getAllowedUserRoles();
             // Create company
             const [companyResult] = await db.query(
                 `INSERT INTO companies (name, email, phone, location, plan, billing_cycle, payment_method, contact_person, client_type, logo_url, tagline, source, created_by, status)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [business_name || name, email || null, phone || null, address || location || null, plan || 'Essentials',
-                 billing_cycle || 'Monthly', payment_method || null, contact_person || contact || null,
-                 (client_type === 'Personal' || plan === 'Free' ? 'SaaS' : (client_type || 'SaaS')),
-                 logo_url || null,
-                 (client_type === 'Personal' || plan === 'Free' ? 'Personal' : (req.body.tagline || null)),
-                 source || 'Admin Dashboard', req.user.id, status || 'active']
+                billing_cycle || 'Monthly', payment_method || null, contact_person || contact || null,
+                (client_type === 'Personal' || plan === 'Free' ? 'SaaS' : (client_type || 'SaaS')),
+                logo_url || null,
+                (client_type === 'Personal' || plan === 'Free' ? 'Personal' : (req.body.tagline || null)),
+                source || 'Admin Dashboard', req.user.id, status || 'active']
             );
             const newCompanyId = companyResult.insertId;
 
@@ -149,21 +224,27 @@ exports.create = async (req, res) => {
                 if (existingUser.length === 0) {
                     const userPassword = password || generatePassword();
                     const hashedPassword = await bcrypt.hash(userPassword, 12);
-                    
+
                     // Normalize client_type for DB ENUM if needed
                     const normalizedClientType = client_type === 'Personal' ? 'Individual' : (client_type || 'SaaS');
 
-                    // Personal/Free clients get 'customer' role, SaaS clients get 'admin' role
-                    const userRole = (client_type === 'Personal' || plan === 'Free') ? 'customer' : 'admin';
+                    // Role mapping for super-admin manual client creation:
+                    // Personal -> customer, SaaS -> saas_client, Business -> business_client
+                    const typeNorm = String(client_type || '').toLowerCase();
+                    let userRole = 'saas_client';
+                    if (client_type === 'Personal' || plan === 'Free') userRole = 'customer';
+                    else if (typeNorm === 'business') userRole = 'business_client';
+                    else if (typeNorm === 'saas') userRole = 'saas_client';
+                    const storedRole = resolveRoleForStorage(userRole, allowedRoles);
 
                     await db.query(
                         `INSERT INTO users (company_id, name, email, password, phone, role, status) VALUES (?, ?, ?, ?, ?, ?, 'active')`,
-                        [newCompanyId, name, email, hashedPassword, phone || null, userRole]
+                        [newCompanyId, name, email, hashedPassword, phone || null, storedRole]
                     );
 
                     // Fire and forget email - don't await to prevent API hanging
                     sendMail(email, 'Welcome to ZaneZion',
-                        `<h2>Your ZaneZion ${userRole === 'customer' ? 'Personal' : 'Institutional'} account is ready!</h2>
+                        `<h2>Your ZaneZion ${storedRole === 'customer' ? 'Personal' : 'Institutional'} account is ready!</h2>
                          <p>Email: <strong>${email}</strong></p>
                          <p>Password: <strong>${userPassword}</strong></p>
                          <p>Type: <strong>${normalizedClientType}</strong></p>`
@@ -240,7 +321,7 @@ exports.create = async (req, res) => {
                 );
 
                 // Fire and forget email
-                sendMail(email, 'Your Account Credentials', 
+                sendMail(email, 'Your Account Credentials',
                     `<h2>Your ZaneZion customer account is ready!</h2>
                      <p>Email: <strong>${email}</strong></p>
                      <p>Password: <strong>${userPassword}</strong></p>`
@@ -263,14 +344,27 @@ exports.create = async (req, res) => {
 // PUT /api/customers/:id
 exports.update = async (req, res) => {
     try {
-        const isSuperAdmin = isSuperAdminRole(req.user.role);
-        const table = isSuperAdmin ? 'companies' : 'customers';
+        const isSuperAdmin = isSuperAdminRole(req.user);
+        let table = isSuperAdmin ? 'companies' : 'customers';
+
+        // --- SMART TABLE SELECTION FOR SUPER ADMIN ---
+        if (isSuperAdmin) {
+            const [compExists] = await db.query('SELECT id FROM companies WHERE id = ?', [req.params.id]);
+            if (compExists.length === 0) {
+                table = 'customers';
+            } else {
+                if (req.body.client_type === 'Personal' || req.body.client_type === 'Direct') {
+                    const [custExists] = await db.query('SELECT id FROM customers WHERE id = ?', [req.params.id]);
+                    if (custExists.length > 0) table = 'customers';
+                }
+            }
+        }
 
         const rawFields = { ...req.body };
-        
+
         // --- MAP CLIENT TYPE FOR DB COMPATIBILITY ---
-        if (rawFields.client_type === 'Personal') {
-            if (isSuperAdmin) {
+        if (rawFields.client_type === 'Personal' || rawFields.client_type === 'Direct') {
+            if (table === 'companies') {
                 rawFields.client_type = 'SaaS';
                 rawFields.tagline = 'Personal';
             } else {
@@ -278,12 +372,18 @@ exports.update = async (req, res) => {
             }
         }
 
-        // --- STRICT WHITELIST PER TABLE (companies & customers have different columns) ---
-        const allowedColumns = isSuperAdmin
+        // --- UNIVERSAL CONTACT & NAME SYNC ---
+        if (rawFields.contact_person && !rawFields.contact) rawFields.contact = rawFields.contact_person;
+        if (rawFields.contact && !rawFields.contact_person) rawFields.contact_person = rawFields.contact;
+        if (rawFields.business_name) rawFields.name = rawFields.business_name;
+        else if (rawFields.name) rawFields.business_name = rawFields.name;
+
+        // --- STRICT WHITELIST PER TABLE ---
+        const allowedColumns = (table === 'companies')
             ? ['name', 'email', 'phone', 'location', 'plan', 'billing_cycle',
-               'payment_method', 'contact_person', 'client_type', 'logo_url',
-               'tagline', 'source', 'status', 'address', 'contact', 'business_name']
-            : ['name', 'email', 'phone', 'contact', 'address', 'client_type', 'status'];
+                'payment_method', 'contact_person', 'client_type', 'logo_url',
+                'tagline', 'source', 'status', 'address', 'contact', 'business_name']
+            : ['name', 'email', 'phone', 'contact', 'address', 'client_type', 'status', 'company_id'];
 
         const sets = [];
         const values = [];
@@ -299,7 +399,7 @@ exports.update = async (req, res) => {
         const cs = companyScope(req);
         values.push(req.params.id);
         if (!isSuperAdmin) values.push(...cs.params);
-        
+
         await db.query(`UPDATE ${table} SET ${sets.join(', ')} WHERE id = ?${isSuperAdmin ? '' : cs.clause}`, values);
 
         // If status changed to active and this customer has no user account yet, create one
@@ -332,9 +432,9 @@ exports.update = async (req, res) => {
                 if (linkedReq.length > 0) {
                     const syncSets = [];
                     const syncVals = [];
-                    if (rawFields.name)           { syncSets.push('client_name = ?');    syncVals.push(rawFields.name); }
-                    if (rawFields.phone)          { syncSets.push('phone = ?');           syncVals.push(rawFields.phone); }
-                    if (rawFields.plan)           { syncSets.push('plan = ?');            syncVals.push(rawFields.plan); }
+                    if (rawFields.name) { syncSets.push('client_name = ?'); syncVals.push(rawFields.name); }
+                    if (rawFields.phone) { syncSets.push('phone = ?'); syncVals.push(rawFields.phone); }
+                    if (rawFields.plan) { syncSets.push('plan = ?'); syncVals.push(rawFields.plan); }
                     if (rawFields.contact_person) { syncSets.push('contact_person = ?'); syncVals.push(rawFields.contact_person); }
                     if (syncSets.length > 0) {
                         syncVals.push(linkedReq[0].id);
@@ -356,26 +456,34 @@ exports.update = async (req, res) => {
 // DELETE /api/customers/:id
 exports.remove = async (req, res) => {
     try {
-        const isSuperAdmin = isSuperAdminRole(req.user.role);
-        const table = isSuperAdmin ? 'companies' : 'customers';
+        const isSuperAdmin = isSuperAdminRole(req.user);
+        let table = isSuperAdmin ? 'companies' : 'customers';
         const cs = companyScope(req);
+
+        // --- SMART TABLE SELECTION FOR DELETION ---
+        if (isSuperAdmin) {
+            const [compExists] = await db.query('SELECT id FROM companies WHERE id = ?', [req.params.id]);
+            if (compExists.length === 0) {
+                table = 'customers';
+            }
+        }
 
         // Fetch record to get email for user deletion
         const query = `SELECT email FROM ${table} WHERE id = ?${isSuperAdmin ? '' : cs.clause}`;
         const queryParams = isSuperAdmin ? [req.params.id] : [req.params.id, ...cs.params];
         const [records] = await db.query(query, queryParams);
-        
+
         if (records.length === 0) return errorResponse(res, 'Client record not found.', 404);
-        
+
         const email = records[0].email;
         if (email) {
             // Delete associated users (Admin/Client for companies, Customer for customers)
             await db.query('DELETE FROM users WHERE email = ? AND role IN ("customer","admin")', [email]);
         }
-        
+
         // Delete the actual record
         await db.query(`DELETE FROM ${table} WHERE id = ?${isSuperAdmin ? '' : cs.clause}`, queryParams);
-        
+
         return successResponse(res, null, 'Client record deleted successfully.');
     } catch (err) {
         console.error('Delete error:', err);

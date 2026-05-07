@@ -5,6 +5,33 @@ const { generateOTP, successResponse, errorResponse } = require('../utils/helper
 const { sendMail } = require('../utils/mailer');
 const { SYSTEM_MENUS } = require('../config/systemMenus');
 
+async function getAllowedUserRoles() {
+    const [rows] = await db.query(
+        `SELECT COLUMN_TYPE
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'users'
+           AND COLUMN_NAME = 'role'
+         LIMIT 1`
+    );
+    const colType = String(rows?.[0]?.COLUMN_TYPE || '');
+    const matches = [...colType.matchAll(/'([^']+)'/g)];
+    return new Set(matches.map((m) => String(m[1] || '').toLowerCase()));
+}
+
+function resolveRoleForStorage(logicalRole, allowedRoles) {
+    const role = String(logicalRole || '').toLowerCase();
+    const aliases = {
+        business_client: ['business_client', 'business client', 'client'],
+        saas_client: ['saas_client', 'saas client', 'admin'],
+        super_admin: ['super_admin', 'superadmin', 'super admin'],
+        customer: ['customer', 'client']
+    };
+    const candidates = aliases[role] || [role];
+    const match = candidates.find((c) => allowedRoles.has(c));
+    return match || logicalRole;
+}
+
 // POST /api/auth/login
 exports.login = async (req, res) => {
     try {
@@ -65,9 +92,12 @@ exports.login = async (req, res) => {
         const menuMap = {};
         SYSTEM_MENUS.forEach(m => { menuMap[m.name] = m; });
 
+        const permRole = String(user.role || '').toLowerCase() === 'business_client'
+            ? 'client'
+            : (String(user.role || '').toLowerCase() === 'saas_client' ? 'admin' : user.role);
         let [rawPerms] = await db.query(
             'SELECT * FROM menu_permissions WHERE role = ? AND (company_id = ? OR company_id IS NULL)',
-            [user.role, user.company_id]
+            [permRole, user.company_id]
         );
 
         // Field staff: effective rights = this user's staff row ∩ same company's admin row (per menu).
@@ -302,8 +332,9 @@ exports.publicSignup = async (req, res) => {
 
         // ── BUSINESS ACCOUNT ──────────────────────────────────────────────────
         // Creates a new tenant (company) with type=Business
-        // User gets role = 'client', status = pending until super_admin approves
+        // User gets role = 'business_client', status = pending until super_admin approves
         if (accountType === 'business') {
+            const allowedRoles = await getAllowedUserRoles();
             const businessLicenseUrl = req.file ? `/uploads/${req.file.filename}` : null;
 
             const [companyResult] = await db.query(
@@ -315,8 +346,16 @@ exports.publicSignup = async (req, res) => {
 
             const [userResult] = await db.query(
                 `INSERT INTO users (name, email, password, phone, role, company_id, business_license_url, status)
-                 VALUES (?, ?, ?, ?, 'client', ?, ?, 'pending')`,
-                [name.trim(), cleanEmail, hashedPassword, phone || null, companyId, businessLicenseUrl]
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+                [
+                    name.trim(),
+                    cleanEmail,
+                    hashedPassword,
+                    phone || null,
+                    resolveRoleForStorage('business_client', allowedRoles),
+                    companyId,
+                    businessLicenseUrl
+                ]
             );
 
             try {
@@ -332,15 +371,16 @@ exports.publicSignup = async (req, res) => {
 
             return successResponse(res, {
                 id: userResult.insertId, name, email: cleanEmail,
-                role: 'client', status: 'pending', companyId
+                role: 'business_client', status: 'pending', companyId
             }, 'Business account submitted for review. You will be notified upon approval.', 201);
         }
 
         // ── SAAS ACCOUNT ──────────────────────────────────────────────────────
         // Creates a new isolated TENANT (company) with type=SaaS
-        // User becomes the TENANT ADMIN (role = 'admin') of that tenant
+        // User becomes SaaS tenant admin (role = 'saas_client')
         // They can then add their own staff (operations, logistics, etc.)
         if (accountType === 'saas') {
+            const allowedRoles = await getAllowedUserRoles();
             const [companyResult] = await db.query(
                 `INSERT INTO companies (name, email, phone, client_type, tenant_type, status, source, saas_fee_paid)
                  VALUES (?, ?, ?, 'SaaS', 'saas', 'pending', 'self_signup', FALSE)`,
@@ -351,8 +391,15 @@ exports.publicSignup = async (req, res) => {
             // SaaS user = Tenant Admin of their own company
             const [userResult] = await db.query(
                 `INSERT INTO users (name, email, password, phone, role, company_id, status)
-                 VALUES (?, ?, ?, ?, 'admin', ?, 'pending')`,
-                [name.trim(), cleanEmail, hashedPassword, phone || null, companyId]
+                 VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
+                [
+                    name.trim(),
+                    cleanEmail,
+                    hashedPassword,
+                    phone || null,
+                    resolveRoleForStorage('saas_client', allowedRoles),
+                    companyId
+                ]
             );
 
             try {
@@ -368,7 +415,7 @@ exports.publicSignup = async (req, res) => {
 
             return successResponse(res, {
                 id: userResult.insertId, name, email: cleanEmail,
-                role: 'admin', status: 'pending', companyId,
+                role: 'saas_client', status: 'pending', companyId,
                 tenantId: companyId
             }, 'SaaS account submitted for review. You will be notified upon approval.', 201);
         }

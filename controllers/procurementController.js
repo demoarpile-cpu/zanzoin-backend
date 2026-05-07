@@ -6,7 +6,16 @@ const { createNotification } = require('./notificationController');
 // --- PURCHASE REQUESTS ---
 exports.getRequests = async (req, res) => {
     try {
-        const cf = companyFilter(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cf;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cf = { clause: '', params: [] };
+        } else {
+            cf = companyFilter(req);
+        }
         const [rows] = await db.query(`SELECT * FROM purchase_requests WHERE 1=1 ${cf.clause} ORDER BY created_at DESC`, cf.params);
         return successResponse(res, rows);
     } catch (err) { return errorResponse(res, 'Failed to fetch requests.', 500); }
@@ -15,7 +24,10 @@ exports.getRequests = async (req, res) => {
 exports.createRequest = async (req, res) => {
     try {
         const { item_name, items, category, quantity, estimated_cost, requester, priority, notes, department } = req.body;
-        const companyId = req.companyScope;
+        let companyId = req.companyScope;
+        
+        // HQ Fix
+        if (companyId == 1) companyId = null;
         const requesterId = req.user.id;
 
         let finalItemName = item_name;
@@ -67,7 +79,17 @@ exports.updateRequest = async (req, res) => {
 
         if (sets.length === 0) return successResponse(res, null, 'No valid fields to update.');
 
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
+
         values.push(req.params.id, ...cs.params);
         await db.query(`UPDATE purchase_requests SET ${sets.join(', ')} WHERE id = ?${cs.clause}`, values);
         
@@ -85,7 +107,16 @@ exports.updateRequest = async (req, res) => {
 
 exports.deleteRequest = async (req, res) => {
     try {
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
         await db.query(`DELETE FROM purchase_requests WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
         return successResponse(res, null, 'Request deleted.');
     } catch (err) { return errorResponse(res, 'Failed to delete request.', 500); }
@@ -94,7 +125,16 @@ exports.deleteRequest = async (req, res) => {
 // --- QUOTES ---
 exports.getQuotes = async (req, res) => {
     try {
-        const cf = companyFilter(req, 'q');
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cf;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cf = { clause: '', params: [] };
+        } else {
+            cf = companyFilter(req, 'q');
+        }
         const [rows] = await db.query(`SELECT q.*, v.name as vendor_name FROM quotes q LEFT JOIN vendors v ON q.vendor_id = v.id WHERE 1=1 ${cf.clause} ORDER BY q.created_at DESC`, cf.params);
         return successResponse(res, rows);
     } catch (err) { return errorResponse(res, 'Failed to fetch quotes.', 500); }
@@ -115,7 +155,10 @@ exports.createQuote = async (req, res) => {
         const prId = purchase_request_id || purchaseRequestId;
         const finalAmount = total_amount || total || totalAmount;
         const finalValidity = validity_date || validity || validityDate;
-        const companyId = req.companyScope;
+        let companyId = req.companyScope;
+        
+        // HQ Fix
+        if (companyId == 1) companyId = null;
 
         const [result] = await db.query(
             `INSERT INTO quotes (company_id, vendor_id, purchase_request_id, items, total_amount, validity_date, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -150,7 +193,17 @@ exports.updateQuote = async (req, res) => {
             values.push(k === 'items' ? JSON.stringify(v) : v);
         }
 
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
+
         values.push(req.params.id, ...cs.params);
         await db.query(`UPDATE quotes SET ${sets.join(', ')} WHERE id = ?${cs.clause}`, values);
         return successResponse(res, { id: req.params.id }, 'Quote updated.');
@@ -162,7 +215,16 @@ exports.updateQuote = async (req, res) => {
 
 exports.deleteQuote = async (req, res) => {
     try {
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
         await db.query(`DELETE FROM quotes WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
         return successResponse(res, null, 'Quote deleted.');
     } catch (err) { return errorResponse(res, 'Failed to delete quote.', 500); }
@@ -171,7 +233,16 @@ exports.deleteQuote = async (req, res) => {
 // --- PURCHASE ORDERS ---
 exports.getPOs = async (req, res) => {
     try {
-        const cf = companyFilter(req, 'po');
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cf;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cf = { clause: '', params: [] };
+        } else {
+            cf = companyFilter(req, 'po');
+        }
         const [rows] = await db.query(`SELECT po.*, v.name as vendor_name FROM purchase_orders po LEFT JOIN vendors v ON po.vendor_id = v.id WHERE 1=1 ${cf.clause} ORDER BY po.created_at DESC`, cf.params);
         return successResponse(res, rows);
     } catch (err) { return errorResponse(res, 'Failed to fetch POs.', 500); }
@@ -180,7 +251,10 @@ exports.getPOs = async (req, res) => {
 exports.createPO = async (req, res) => {
     try {
         const { vendorId, vendor_id, items, total_amount, total, totalAmount, notes } = req.body;
-        const companyId = req.companyScope;
+        let companyId = req.companyScope;
+        
+        // HQ Fix
+        if (companyId == 1) companyId = null;
         const vId = vendor_id || vendorId;
         const finalAmount = total_amount || total || totalAmount || 0;
 
@@ -223,7 +297,17 @@ exports.updatePO = async (req, res) => {
 
         if (sets.length === 0) return successResponse(res, { id: req.params.id }, 'Nothing to update.');
 
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
+
         values.push(req.params.id, ...cs.params);
         await db.query(`UPDATE purchase_orders SET ${sets.join(', ')} WHERE id = ?${cs.clause}`, values);
         return successResponse(res, { id: req.params.id }, 'PO updated.');
@@ -238,7 +322,17 @@ exports.receiveGoods = async (req, res) => {
     try {
         const { id } = req.params;
         const receivedItems = req.body;
-        const cs = companyScope(req);
+        
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
 
         const [pos] = await db.query(`SELECT * FROM purchase_orders WHERE id = ?${cs.clause}`, [id, ...cs.params]);
         if (pos.length === 0) return errorResponse(res, 'PO not found.', 404);

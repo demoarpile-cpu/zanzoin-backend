@@ -1,0 +1,3 @@
+[2026-05-07T05:17:24.724Z] PUT /clients/12 - Role: admin
+[2026-05-07T05:28:42.378Z] PUT /clients/12 - Role: admin
+[2026-05-07T05:29:34.973Z] PUT /clients/12 - Role: admin

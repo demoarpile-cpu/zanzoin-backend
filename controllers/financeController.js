@@ -6,7 +6,16 @@ const { createNotification } = require('./notificationController');
 // --- INVOICES ---
 exports.getInvoices = async (req, res) => {
     try {
-        const cf = companyFilter(req, 'i');
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cf;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cf = { clause: '', params: [] };
+        } else {
+            cf = companyFilter(req, 'i');
+        }
         const [rows] = await db.query(
             `SELECT i.*, c.name as client_name FROM invoices i LEFT JOIN companies c ON i.client_id = c.id WHERE 1=1 ${cf.clause} ORDER BY i.created_at DESC`,
             cf.params
@@ -20,6 +29,10 @@ exports.createInvoice = async (req, res) => {
         const { order_id, client_id, amount, due_date, status } = req.body;
         // For super_admin: companyScope is null, so resolve from client_id or order
         let companyId = req.companyScope;
+        
+        // HQ Fix
+        if (companyId == 1) companyId = null;
+
         if (!companyId && client_id) {
             companyId = client_id;
         }
@@ -63,7 +76,16 @@ exports.createInvoice = async (req, res) => {
 exports.updateInvoice = async (req, res) => {
     try {
         const { amount, due_date, status } = req.body;
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
         await db.query(
             `UPDATE invoices SET amount = COALESCE(?, amount), due_date = COALESCE(?, due_date), status = COALESCE(?, status) WHERE id = ?${cs.clause}`,
             [amount, due_date, status, req.params.id, ...cs.params]
@@ -74,7 +96,16 @@ exports.updateInvoice = async (req, res) => {
 
 exports.deleteInvoice = async (req, res) => {
     try {
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
         await db.query(`DELETE FROM invoices WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
         return successResponse(res, null, 'Invoice deleted.');
     } catch (err) { return errorResponse(res, 'Failed to delete invoice.', 500); }
@@ -85,7 +116,16 @@ exports.payInvoice = async (req, res) => {
     try {
         const { amount, payment_method, transaction_id } = req.body;
         const invoiceId = req.params.id;
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
 
         // Verify invoice belongs to company
         const [check] = await db.query(`SELECT id FROM invoices WHERE id = ?${cs.clause}`, [invoiceId, ...cs.params]);
@@ -146,7 +186,16 @@ exports.getMyPayroll = async (req, res) => {
 // GET /api/finance/payroll
 exports.getAllPayroll = async (req, res) => {
     try {
-        const cf = companyFilter(req, 'p');
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cf;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cf = { clause: '', params: [] };
+        } else {
+            cf = companyFilter(req, 'p');
+        }
         const [rows] = await db.query(
             `SELECT p.*, p.net_amount as amount, u.name as user_name FROM payroll p 
              LEFT JOIN users u ON p.user_id = u.id 
@@ -170,7 +219,8 @@ exports.createPayroll = async (req, res) => {
             net_amount, method, payment_date, status 
         } = req.body;
         
-        const companyId = req.companyScope;
+        let companyId = req.companyScope;
+        if (companyId == 1) companyId = null;
 
         const [result] = await db.query(
             `INSERT INTO payroll (
@@ -223,7 +273,16 @@ exports.updatePayroll = async (req, res) => {
 
         if (sets.length === 0) return errorResponse(res, 'No valid fields to update.', 400);
 
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
         values.push(req.params.id, ...cs.params);
         
         await db.query(`UPDATE payroll SET ${sets.join(', ')} WHERE id = ?${cs.clause}`, values);
@@ -238,7 +297,16 @@ exports.updatePayroll = async (req, res) => {
 // DELETE /api/finance/payroll/:id
 exports.deletePayroll = async (req, res) => {
     try {
-        const cs = companyScope(req);
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+        
+        let cs;
+        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+            cs = { clause: '', params: [] };
+        } else {
+            cs = companyScope(req);
+        }
         await db.query(`DELETE FROM payroll WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
         return successResponse(res, null, 'Payroll record deleted.');
     } catch (err) {
