@@ -75,7 +75,7 @@ exports.updateAssignment = async (req, res) => {
 exports.clockIn = async (req, res) => {
     try {
         const { location } = req.body;
-        const companyId = req.user.company_id;
+        const companyId = req.companyScope;
 
         const [active] = await db.query(
             'SELECT id FROM shifts WHERE user_id = ? AND clock_out IS NULL', [req.user.id]
@@ -163,12 +163,14 @@ exports.createLeaveRequest = async (req, res) => {
         const leaveTypeMap = {
             vacation: 'vacation',
             sick: 'sick',
+            'sick leave': 'sick',
             personal: 'personal',
+            'personal leave': 'personal',
             bereavement: 'bereavement'
         };
         const leave_type = leaveTypeMap[String(rawLeaveType).trim().toLowerCase()];
-        const start_date = req.body.start_date || req.body.startDate;
-        const end_date = req.body.end_date || req.body.endDate;
+        let start_date = req.body.start_date || req.body.startDate;
+        let end_date = req.body.end_date || req.body.endDate;
         const reason = req.body.reason;
 
         if (!leave_type) {
@@ -177,7 +179,15 @@ exports.createLeaveRequest = async (req, res) => {
         if (!start_date || !end_date) {
             return errorResponse(res, 'Start date and end date are required.', 400);
         }
-        const companyId = req.user.company_id;
+
+        try {
+            start_date = new Date(start_date).toISOString().split('T')[0];
+            end_date = new Date(end_date).toISOString().split('T')[0];
+        } catch(e) {
+            return errorResponse(res, 'Invalid date format.', 400);
+        }
+
+        const companyId = req.companyScope;
         const [result] = await db.query(
             `INSERT INTO leave_requests (company_id, user_id, leave_type, start_date, end_date, reason) VALUES (?, ?, ?, ?, ?, ?)`,
             [companyId, req.user.id, leave_type, start_date, end_date, reason || null]
@@ -186,7 +196,7 @@ exports.createLeaveRequest = async (req, res) => {
         return successResponse(res, { id: result.insertId }, 'Leave request submitted.', 201);
     } catch (err) {
         console.error('Create leave request error:', err);
-        return errorResponse(res, 'Failed to submit leave request.', 500);
+        return errorResponse(res, 'Failed to submit leave request. DB Error: ' + err.message, 500);
     }
 };
 

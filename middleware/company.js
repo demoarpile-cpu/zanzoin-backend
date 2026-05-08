@@ -15,16 +15,17 @@ const scopeByCompany = (req, res, next) => {
     }
 
     // Customer role: no company, scoped by user ID in controllers
-    if (req.user.role === 'customer') {
+    if (roleNorm === 'customer' || roleNorm === 'client') {
         req.companyScope = null;
         req.isCustomer = true;
         return next();
     }
 
-    // Admin role without company_id → default to ZaneZion HQ (id=1)
-    if (req.user.role === 'admin' && !req.user.company_id) {
-        req.companyScope = 1;
-        req.tenantId = 1;
+    // Internal roles without company_id → default to ZaneZion HQ (null)
+    const internalRoles = ['admin', 'operation', 'procurement', 'inventory', 'logistics', 'concierge', 'staff', 'finance'];
+    if (internalRoles.includes(roleNorm) && !req.user.company_id) {
+        req.companyScope = null;
+        req.tenantId = null;
         return next();
     }
 
