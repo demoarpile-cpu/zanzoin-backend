@@ -4,15 +4,17 @@ const requireRole = (...allowedRoles) => {
             return res.status(401).json({ success: false, message: 'Not authenticated.' });
         }
 
-        // Super admin always has access
-        if (req.user.role === 'super_admin') {
+        // Normalize user role first — before any checks
+        const normalizedUser = String(req.user.role || '').toLowerCase().trim().replace(/\s+/g, '_');
+
+        // Super admin always has access (handle both 'super_admin' and 'superadmin')
+        if (normalizedUser === 'super_admin' || normalizedUser === 'superadmin') {
             return next();
         }
 
-        const normalizedUser = String(req.user.role || '').toLowerCase().trim().replace(/\s+/g, '_');
-        let effectiveRole = normalizedUser === 'operations' ? 'operation' : normalizedUser;
-        // New tenant-facing aliases
-        if (effectiveRole === 'business_client' || effectiveRole === 'client') effectiveRole = 'client';
+        let effectiveRole = normalizedUser;
+        // Tenant-facing aliases
+        if (effectiveRole === 'business_client') effectiveRole = 'client';
         if (effectiveRole === 'saas_client') effectiveRole = 'admin';
 
         const allowed = allowedRoles.some((a) => effectiveRole === String(a).toLowerCase());

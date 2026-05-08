@@ -167,9 +167,13 @@ exports.createDelivery = async (req, res) => {
         // Sanitize pickup_time - must be valid time or null
         const safePickupTime = pickup_time && pickup_time !== '' ? pickup_time : null;
 
+        // Validate mission_type against ENUM constraints
+        const allowedMissionTypes = ['Delivery', 'Pickup', 'Transfer', 'Chauffeur'];
+        const safeMissionType = allowedMissionTypes.includes(mission_type) ? mission_type : 'Delivery';
+
         const [result] = await db.query(
             `INSERT INTO deliveries (company_id, order_id, mission_type, route, driver_name, plate_number, package_details, pickup_location, drop_location, passenger_info, delivery_date, pickup_time, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [companyId, safeOrderId, mission_type || 'Delivery', route || null, driver_name || null, plate_number || null, typeof package_details === 'string' ? package_details : JSON.stringify(package_details || []), pickup_location || null, drop_location || null, typeof passenger_info === 'string' ? passenger_info : JSON.stringify(passenger_info || null), safeDeliveryDate, safePickupTime, status || 'pending']
+            [companyId, safeOrderId, safeMissionType, route || null, driver_name || null, plate_number || null, typeof package_details === 'string' ? package_details : JSON.stringify(package_details || []), pickup_location || null, drop_location || null, typeof passenger_info === 'string' ? passenger_info : JSON.stringify(passenger_info || null), safeDeliveryDate, safePickupTime, status || 'pending']
         );
         // Notify on new delivery / chauffeur request
         const isChauffeur = (mission_type || '').toLowerCase() === 'chauffeur';

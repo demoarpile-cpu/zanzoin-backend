@@ -9,9 +9,9 @@ router.use(verifyToken, scopeByCompany);
 
 router.get('/', ctrl.getAll);
 router.get('/alerts', ctrl.getAlerts);
-router.post('/', requireRole('super_admin', 'admin', 'inventory', 'procurement'), ctrl.create);
-router.put('/:id', requireRole('super_admin', 'admin', 'inventory'), ctrl.update);
+router.post('/', requireRole('super_admin', 'admin', 'inventory', 'procurement', 'operations', 'concierge', 'client'), ctrl.create);
+router.put('/:id', requireRole('super_admin', 'admin', 'inventory', 'operations', 'concierge', 'client'), ctrl.update);
 router.delete('/:id', requireRole('super_admin', 'admin', 'inventory'), ctrl.remove);
-router.post('/:id/adjust', requireRole('super_admin', 'admin', 'inventory', 'procurement'), ctrl.adjust);
+router.post('/:id/adjust', requireRole('super_admin', 'admin', 'inventory', 'procurement', 'operations', 'concierge', 'client'), ctrl.adjust);
 
 module.exports = router;
