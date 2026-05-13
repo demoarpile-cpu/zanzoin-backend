@@ -5,9 +5,26 @@ const { successResponse, errorResponse } = require('../utils/helpers');
 // GET /api/dashboard/stats
 exports.getStats = async (req, res) => {
     try {
-        const cf = companyFilter(req);
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(String(req.user.role || '').toLowerCase());
+        const isHQ = (req.user.company_id == 1 || !req.user.company_id || req.companyScope == 1);
+
         const cfAlias = (alias) => {
-            if (req.companyScope === null) return { clause: '', params: [] };
+            if (isSuperAdmin) return { clause: '', params: [] };
+            
+            if (req.companyScope === null || req.companyScope === undefined) {
+                if (isHQ) {
+                    // For HQ admins, limit stats to things they created or are assigned to
+                    if (['c', 'u'].includes(alias)) {
+                        return { clause: ` AND ${alias}.created_by = ?`, params: [req.user.id] };
+                    }
+                    if (alias === 'o') {
+                        return { clause: ` AND ${alias}.created_by = ?`, params: [req.user.id] };
+                    }
+                    // For others, keep as is or limit
+                    return { clause: '', params: [] };
+                }
+                return { clause: '', params: [] };
+            }
             return { clause: ` AND ${alias}.company_id = ?`, params: [req.companyScope] };
         };
 

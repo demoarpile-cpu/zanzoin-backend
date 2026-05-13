@@ -3,6 +3,12 @@ const { companyFilter, companyScope } = require('../middleware/company');
 const { successResponse, errorResponse } = require('../utils/helpers');
 const { createNotification } = require('./notificationController');
 
+function parsePositiveIntOrNull(v) {
+    if (v === undefined || v === null || v === '') return null;
+    const n = parseInt(String(v).trim(), 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 exports.getAll = async (req, res) => {
     try {
         const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
@@ -59,33 +65,70 @@ exports.getAlerts = async (req, res) => {
 
 exports.create = async (req, res) => {
     try {
-        const { name, sku, category, price, quantity, warehouse_id, vendor_id, client_id, inventory_type } = req.body;
-        let companyId = req.body.company_id || req.companyScope;
-        
-        // If companyId is 1 (HQ), we use NULL to satisfy foreign key constraints
+        const b = req.body;
+        const name = b.name;
+        const sku = b.sku;
+        const category = b.category;
+        const price = b.price !== undefined && b.price !== '' ? parseFloat(b.price) : 0;
+        const qty = b.quantity !== undefined && b.quantity !== '' ? parseInt(b.quantity, 10) : 0;
+        const warehouse_id = parsePositiveIntOrNull(b.warehouse_id);
+        const vendor_id = parsePositiveIntOrNull(b.vendor_id);
+        const client_id = parsePositiveIntOrNull(b.client_id);
+        const inventory_type = b.inventory_type || 'Marketplace';
+
+        let companyId = b.company_id || req.companyScope;
         if (companyId == 1) companyId = null;
 
-        const qty = parseInt(quantity) || 0;
-        const threshold = req.body.threshold || 10;
-        const status = qty === 0 ? 'out_of_stock' : qty <= threshold ? 'low_stock' : 'in_stock';
+        const threshold = b.threshold != null && b.threshold !== '' ? parseInt(b.threshold, 10) : 10;
+        const quantity = Number.isFinite(qty) ? qty : 0;
+        const status = quantity === 0 ? 'out_of_stock' : quantity <= threshold ? 'low_stock' : 'in_stock';
+
+        let image_url = b.image_url && String(b.image_url).trim() !== '' ? String(b.image_url).trim() : null;
+        if (req.file && req.file.filename) {
+            image_url = `/uploads/${req.file.filename}`;
+        }
+
+        if (!name || String(name).trim() === '') {
+            return errorResponse(res, 'Product name is required.', 400);
+        }
+
+        const { size, color, material, specifications, description } = b;
 
         const [result] = await db.query(
-            `INSERT INTO inventory (company_id, name, sku, category, price, quantity, threshold, warehouse_id, vendor_id, client_id, inventory_type, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [companyId, name, sku || `SKU-${Date.now()}`, category || null, price || 0, qty, threshold, warehouse_id || null, vendor_id || null, client_id || null, inventory_type || 'Marketplace', status]
+            `INSERT INTO inventory (company_id, name, sku, category, price, quantity, threshold, warehouse_id, vendor_id, client_id, inventory_type, status, image_url, size, color, material, specifications, description)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [companyId, name.trim(), sku || `SKU-${Date.now()}`, category || null, price || 0, quantity, threshold, warehouse_id, vendor_id, client_id, inventory_type, status, image_url, size || null, color || null, material || null, specifications || null, description || null]
         );
-        return successResponse(res, { id: result.insertId, name, quantity: qty, status }, 'Inventory item created.', 201);
-    } catch (err) { return errorResponse(res, 'Failed to create item.', 500); }
+        return successResponse(res, { id: result.insertId, name: name.trim(), quantity, status, image_url }, 'Inventory item created.', 201);
+    } catch (err) {
+        console.error('Inventory create error:', err);
+        return errorResponse(res, err.message || 'Failed to create item.', 500);
+    }
 };
 
 exports.update = async (req, res) => {
     try {
-        const { name, category, price, quantity, warehouse_id, vendor_id, client_id } = req.body;
-        const qty = quantity !== undefined ? parseInt(quantity) : undefined;
+        const b = req.body;
+        const { name, category, price, quantity, warehouse_id, vendor_id, client_id } = b;
+        const qty = quantity !== undefined && quantity !== '' ? parseInt(quantity, 10) : undefined;
         let status;
-        if (qty !== undefined) {
-            const threshold = req.body.threshold || 10;
+        if (qty !== undefined && Number.isFinite(qty)) {
+            const threshold = b.threshold != null && b.threshold !== '' ? parseInt(b.threshold, 10) : 10;
             status = qty === 0 ? 'out_of_stock' : qty <= threshold ? 'low_stock' : 'in_stock';
+        }
+
+        const whId = warehouse_id !== undefined ? parsePositiveIntOrNull(warehouse_id) : undefined;
+        const vId = vendor_id !== undefined ? parsePositiveIntOrNull(vendor_id) : undefined;
+        const cId = client_id !== undefined ? parsePositiveIntOrNull(client_id) : undefined;
+
+        let imagePatch = '';
+        const imageParams = [];
+        if (req.file && req.file.filename) {
+            imagePatch = ', image_url = ?';
+            imageParams.push(`/uploads/${req.file.filename}`);
+        } else if (b.image_url !== undefined) {
+            imagePatch = ', image_url = ?';
+            imageParams.push(b.image_url && String(b.image_url).trim() !== '' ? String(b.image_url).trim() : null);
         }
 
         const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
@@ -99,14 +142,21 @@ exports.update = async (req, res) => {
             cs = companyScope(req);
         }
 
+        const { size, color, material, specifications, description } = b;
+
         await db.query(
             `UPDATE inventory SET name = COALESCE(?, name), category = COALESCE(?, category), price = COALESCE(?, price),
              quantity = COALESCE(?, quantity), warehouse_id = COALESCE(?, warehouse_id), vendor_id = COALESCE(?, vendor_id),
-             client_id = COALESCE(?, client_id) ${status ? ', status = ?' : ''} WHERE id = ?${cs.clause}`,
-            [name, category, price, qty, warehouse_id, vendor_id, client_id, ...(status ? [status] : []), req.params.id, ...cs.params]
+             client_id = COALESCE(?, client_id), size = COALESCE(?, size), color = COALESCE(?, color),
+             material = COALESCE(?, material), specifications = COALESCE(?, specifications), description = COALESCE(?, description)
+             ${status ? ', status = ?' : ''}${imagePatch} WHERE id = ?${cs.clause}`,
+            [name, category, price, qty, whId, vId, cId, size, color, material, specifications, description, ...(status ? [status] : []), ...imageParams, req.params.id, ...cs.params]
         );
         return successResponse(res, { id: req.params.id }, 'Item updated.');
-    } catch (err) { return errorResponse(res, 'Failed to update item.', 500); }
+    } catch (err) {
+        console.error('Inventory update error:', err);
+        return errorResponse(res, err.message || 'Failed to update item.', 500);
+    }
 };
 
 exports.remove = async (req, res) => {
@@ -294,4 +344,24 @@ exports.deleteWarehouse = async (req, res) => {
         await db.query(`DELETE FROM warehouses WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
         return successResponse(res, null, 'Warehouse deleted.');
     } catch (err) { return errorResponse(res, 'Failed to delete warehouse.', 500); }
+};
+
+exports.getMovements = async (req, res) => {
+    try {
+        const [rows] = await db.query(`
+            SELECT 
+                im.*, 
+                i.name as item_name,
+                u.name as performed_by_name
+            FROM inventory_movements im
+            LEFT JOIN inventory i ON im.inventory_id = i.id
+            LEFT JOIN users u ON im.performed_by = u.id
+            ORDER BY im.created_at DESC
+            LIMIT 500
+        `);
+        return successResponse(res, rows);
+    } catch (err) {
+        console.error('Get movements error:', err);
+        return errorResponse(res, 'Failed to fetch stock movements.', 500);
+    }
 };

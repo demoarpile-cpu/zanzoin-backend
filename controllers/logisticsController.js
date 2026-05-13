@@ -23,7 +23,7 @@ exports.getVehicles = async (req, res) => {
         const roleNorm = String(req.user?.role || '').toLowerCase().trim().replace(/\s+/g, '_');
         const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
         const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
-        
+
         let cf;
         if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
             cf = { clause: '', params: [] };
@@ -55,11 +55,11 @@ exports.updateVehicle = async (req, res) => {
             if (['id', 'created_at', 'company_id'].includes(k)) continue;
             sets.push(`${k} = ?`); values.push(v);
         }
-        
+
         const roleNorm = String(req.user?.role || '').toLowerCase().trim().replace(/\s+/g, '_');
         const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
         const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
-        
+
         let cs;
         if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
             cs = { clause: '', params: [] };
@@ -78,7 +78,7 @@ exports.deleteVehicle = async (req, res) => {
         const roleNorm = String(req.user?.role || '').toLowerCase().trim().replace(/\s+/g, '_');
         const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
         const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
-        
+
         let cs;
         if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
             cs = { clause: '', params: [] };
@@ -97,9 +97,19 @@ exports.getDeliveries = async (req, res) => {
         const roleNorm = String(req.user?.role || '').toLowerCase().trim().replace(/\s+/g, '_');
         if (roleNorm === 'super_admin' || roleNorm === 'superadmin') {
             const [rows] = await db.query(
-                `SELECT d.*, v.plate_number as vehicle_plate
+                `SELECT d.*, 
+                        d.assigned_driver as driverId,
+                        d.vehicle_id as vehicleId,
+                        v.plate_number as vehicle_plate,
+                        u.name as driver_name,
+                        u.profile_pic_url as driver_profile_url,
+                        o.delivery_instructions as order_instructions,
+                        o.notes as order_notes,
+                        o.total_amount as order_total_amount
                  FROM deliveries d
                  LEFT JOIN vehicles v ON d.vehicle_id = v.id
+                 LEFT JOIN users u ON d.assigned_driver = u.id
+                 LEFT JOIN orders o ON d.order_id = o.id
                  ORDER BY d.created_at DESC`
             );
             return successResponse(res, rows);
@@ -114,21 +124,57 @@ exports.getDeliveries = async (req, res) => {
         }
         if (!companyId) return successResponse(res, []);
 
-        const [rows] = await db.query(
-            `SELECT d.*, v.plate_number as vehicle_plate
-             FROM deliveries d
-             LEFT JOIN vehicles v ON d.vehicle_id = v.id
-             WHERE d.company_id = ?
-             ORDER BY d.created_at DESC`,
-            [companyId]
-        );
+        // Logic for Staff isolation
+        const isStaffOnly = ['staff', 'field_staff', 'driver'].includes(roleNorm);
+        let query = `
+            SELECT d.*, 
+                   d.assigned_driver as driverId,
+                   d.vehicle_id as vehicleId,
+                   v.plate_number as vehicle_plate,
+                   u.name as driver_name,
+                   u.profile_pic_url as driver_profile_url,
+                   o.delivery_instructions as order_instructions,
+                   o.notes as order_notes,
+                   o.total_amount as order_total_amount
+            FROM deliveries d
+            LEFT JOIN vehicles v ON d.vehicle_id = v.id
+            LEFT JOIN users u ON d.assigned_driver = u.id
+            LEFT JOIN orders o ON d.order_id = o.id
+            WHERE d.company_id = ?
+        `;
+        let params = [companyId];
+
+        if (isStaffOnly) {
+            query += ` AND (d.assigned_driver = ? OR d.assigned_driver IS NULL)`;
+            params.push(req.user.id);
+        }
+
+        query += ` ORDER BY d.created_at DESC`;
+
+        const [rows] = await db.query(query, params);
         return successResponse(res, rows);
     } catch (err) { return errorResponse(res, 'Failed to fetch deliveries.', 500); }
 };
 
 exports.createDelivery = async (req, res) => {
     try {
-        const { order_id, route, driver_name, plate_number, package_details, status, mission_type, pickup_location, drop_location, passenger_info, delivery_date, pickup_time } = req.body;
+        const {
+            order_id,
+            route,
+            driver_name,
+            plate_number,
+            package_details,
+            status,
+            mission_type,
+            pickup_location,
+            drop_location,
+            passenger_info,
+            delivery_date,
+            pickup_time,
+            assigned_driver,
+            delivery_instructions,
+            delivery_fee
+        } = req.body;
         // For super_admin: resolve company_id from request body or from the order
         let companyId = await resolveValidCompanyId(req.companyScope);
         if (!companyId) companyId = await resolveValidCompanyId(req.body.company_id);
@@ -171,20 +217,79 @@ exports.createDelivery = async (req, res) => {
         const allowedMissionTypes = ['Delivery', 'Pickup', 'Transfer', 'Chauffeur'];
         const safeMissionType = allowedMissionTypes.includes(mission_type) ? mission_type : 'Delivery';
 
-        const [result] = await db.query(
-            `INSERT INTO deliveries (company_id, order_id, mission_type, route, driver_name, plate_number, package_details, pickup_location, drop_location, passenger_info, delivery_date, pickup_time, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [companyId, safeOrderId, safeMissionType, route || null, driver_name || null, plate_number || null, typeof package_details === 'string' ? package_details : JSON.stringify(package_details || []), pickup_location || null, drop_location || null, typeof passenger_info === 'string' ? passenger_info : JSON.stringify(passenger_info || null), safeDeliveryDate, safePickupTime, status || 'pending']
-        );
-        // Notify on new delivery / chauffeur request
+        const feeVal =
+            delivery_fee !== undefined && delivery_fee !== null && delivery_fee !== ''
+                ? parseFloat(delivery_fee)
+                : null;
+        const instructVal =
+            delivery_instructions != null && String(delivery_instructions).trim() !== ''
+                ? String(delivery_instructions).trim()
+                : null;
+
+        let result;
+        try {
+            [result] = await db.query(
+                `INSERT INTO deliveries (company_id, order_id, mission_type, route, driver_name, plate_number, package_details, pickup_location, drop_location, passenger_info, delivery_date, pickup_time, status, assigned_driver, delivery_instructions, delivery_fee) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    companyId,
+                    safeOrderId,
+                    safeMissionType,
+                    route || null,
+                    driver_name || null,
+                    plate_number || null,
+                    typeof package_details === 'string' ? package_details : JSON.stringify(package_details || []),
+                    pickup_location || null,
+                    drop_location || null,
+                    typeof passenger_info === 'string' ? passenger_info : JSON.stringify(passenger_info || null),
+                    safeDeliveryDate,
+                    safePickupTime,
+                    status || 'pending',
+                    assigned_driver || null,
+                    instructVal,
+                    Number.isFinite(feeVal) ? feeVal : null
+                ]
+            );
+        } catch (insErr) {
+            if (insErr.code === 'ER_BAD_FIELD_ERROR') {
+                [result] = await db.query(
+                    `INSERT INTO deliveries (company_id, order_id, mission_type, route, driver_name, plate_number, package_details, pickup_location, drop_location, passenger_info, delivery_date, pickup_time, status, assigned_driver) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                        companyId,
+                        safeOrderId,
+                        safeMissionType,
+                        route || null,
+                        driver_name || null,
+                        plate_number || null,
+                        typeof package_details === 'string' ? package_details : JSON.stringify(package_details || []),
+                        pickup_location || null,
+                        drop_location || null,
+                        typeof passenger_info === 'string' ? passenger_info : JSON.stringify(passenger_info || null),
+                        safeDeliveryDate,
+                        safePickupTime,
+                        status || 'pending',
+                        assigned_driver || null
+                    ]
+                );
+            } else {
+                throw insErr;
+            }
+        }
+
+        // Notify on new delivery / chauffeur request (admin + concierge + logistics for VIP rides)
         const isChauffeur = (mission_type || '').toLowerCase() === 'chauffeur';
-        await createNotification({
-            companyId,
-            roleTarget: isChauffeur ? 'concierge' : 'logistics',
-            type: 'delivery',
-            title: isChauffeur ? 'New Chauffeur Request' : 'New Delivery Created',
-            message: isChauffeur ? `Chauffeur service requested — pickup: ${pickup_location || 'TBD'}` : `Delivery #${result.insertId} created for Order #${safeOrderId || 'N/A'}`,
-            link: isChauffeur ? '/dashboard/chauffeur' : '/dashboard/deliveries'
-        });
+        const notifyRoles = isChauffeur ? ['admin', 'concierge', 'logistics', 'super_admin'] : ['logistics'];
+        for (const rt of notifyRoles) {
+            await createNotification({
+                companyId,
+                roleTarget: rt,
+                type: 'delivery',
+                title: isChauffeur ? 'New Chauffeur Request' : 'New Delivery Created',
+                message: isChauffeur
+                    ? `Chauffeur service requested — pickup: ${pickup_location || 'TBD'}`
+                    : `Delivery #${result.insertId} created for Order #${safeOrderId || 'N/A'}`,
+                link: isChauffeur ? '/dashboard/chauffeur' : '/dashboard/deliveries'
+            });
+        }
 
         return successResponse(res, { id: result.insertId }, 'Delivery created.', 201);
     } catch (err) {
@@ -195,24 +300,56 @@ exports.createDelivery = async (req, res) => {
 
 exports.updateDeliveryStatus = async (req, res) => {
     try {
-        const { status, vehicle_id, signature, driver_name, plate_number } = req.body;
-        const sets = ['status = ?'];
-        const values = [status];
+        const { status, vehicle_id, signature, driver_name, plate_number, assigned_driver, passenger_info, delivery_instructions } = req.body;
+        const sets = [];
+        const values = [];
 
+        if (status) { sets.push('status = ?'); values.push(status); }
         if (vehicle_id) { sets.push('vehicle_id = ?'); values.push(vehicle_id); }
         if (signature) { sets.push('signature = ?'); values.push(signature); }
-        if (driver_name) { sets.push('driver_name = ?'); values.push(driver_name); }
-        if (plate_number) { sets.push('plate_number = ?'); values.push(plate_number); }
+        if (driver_name !== undefined) { sets.push('driver_name = ?'); values.push(driver_name); }
+        if (plate_number !== undefined) { sets.push('plate_number = ?'); values.push(plate_number); }
+        if (assigned_driver !== undefined) { sets.push('assigned_driver = ?'); values.push(assigned_driver || null); }
+        if (passenger_info !== undefined) {
+            sets.push('passenger_info = ?');
+            values.push(typeof passenger_info === 'string' ? passenger_info : JSON.stringify(passenger_info));
+        }
+        if (delivery_instructions !== undefined) {
+            sets.push('delivery_instructions = ?');
+            values.push(delivery_instructions);
+        }
+
+        if (sets.length === 0) return errorResponse(res, 'No fields to update.', 400);
 
         const cs = companyScope(req);
         values.push(req.params.id, ...cs.params);
         await db.query(`UPDATE deliveries SET ${sets.join(', ')} WHERE id = ?${cs.clause}`, values);
 
+        // Sync assignment to order if provided
+        if (assigned_driver) {
+            const [del] = await db.query(`SELECT order_id FROM deliveries WHERE id = ?`, [req.params.id]);
+            if (del.length > 0 && del[0].order_id) {
+                await db.query(`UPDATE orders SET assigned_to = ? WHERE id = ?`, [assigned_driver, del[0].order_id]);
+                await db.query(`INSERT INTO order_flow_logs (order_id, stage, status, assigned_to, notes) VALUES (?, 'logistics', 'assigned', ?, 'Driver assigned to delivery mission')`, [del[0].order_id, assigned_driver]);
+            }
+        }
+
         // If delivered, update vehicle status back to available
+        // If delivered, update vehicle status back to available AND sync order status AND handle payout hold
         if (status === 'delivered' || status === 'completed') {
-            const [del] = await db.query(`SELECT vehicle_id FROM deliveries WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
-            if (del.length > 0 && del[0].vehicle_id) {
-                await db.query(`UPDATE vehicles SET status = 'available' WHERE id = ?`, [del[0].vehicle_id]);
+            const [del] = await db.query(`SELECT vehicle_id, order_id, delivery_fee FROM deliveries WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
+            if (del.length > 0) {
+                if (del[0].vehicle_id) {
+                    await db.query(`UPDATE vehicles SET status = 'available' WHERE id = ?`, [del[0].vehicle_id]);
+                }
+                if (del[0].order_id) {
+                    await db.query(`UPDATE orders SET status = 'completed', current_stage = 'completed' WHERE id = ?`, [del[0].order_id]);
+                    await db.query(`INSERT INTO order_flow_logs (order_id, stage, status, notes) VALUES (?, 'completed', 'completed', 'Delivered via Logistics Mission')`, [del[0].order_id,]);
+                }
+                // Initialize payout hold: 48 hours from now
+                if (del[0].delivery_fee > 0) {
+                    await db.query(`UPDATE deliveries SET payout_status = 'held', payout_ready_at = DATE_ADD(NOW(), INTERVAL 48 HOUR) WHERE id = ?`, [req.params.id]);
+                }
             }
         }
 

@@ -184,6 +184,82 @@ const migrations = [
             `);
             console.log('  ✅ logistics_tracking and logistics_urgent_tasks tables ensured');
         }
+    },
+    {
+        name: '011_inventory_image_url',
+        up: async () => {
+            await addColumnIfMissing('inventory', 'image_url', 'VARCHAR(500) NULL', 'status');
+            console.log('  ✅ inventory.image_url ensured (product photos)');
+        }
+    },
+    {
+        name: '012_order_and_delivery_instructions',
+        up: async () => {
+            await addColumnIfMissing('orders', 'delivery_instructions', 'TEXT NULL', 'notes');
+            await addColumnIfMissing('deliveries', 'delivery_instructions', 'TEXT NULL', 'drop_location');
+            await addColumnIfMissing('deliveries', 'delivery_fee', 'DECIMAL(12,2) NULL', 'status');
+            console.log('  ✅ orders/deliveries: delivery_instructions + delivery_fee columns');
+        }
+    },
+    {
+        name: '013_orders_enum_concierge',
+        up: async () => {
+            try {
+                await db.query(`
+                    ALTER TABLE orders
+                    MODIFY COLUMN status ENUM(
+                        'created','admin_review','concierge','operation','procurement','inventory','logistics',
+                        'completed','cancelled','in_progress','delivered'
+                    ) DEFAULT 'created',
+                    MODIFY COLUMN current_stage ENUM(
+                        'created','admin_review','concierge','operation','procurement','inventory','logistics',
+                        'completed','in_progress'
+                    ) DEFAULT 'created'
+                `);
+                console.log('  ✅ orders.status/current_stage: concierge');
+            } catch (e) {
+                console.log('  🕒 orders concierge enum skipped:', e.message);
+            }
+        }
+    },
+    {
+        name: '014_order_flow_logs_workflow_flex',
+        up: async () => {
+            // Stages like logistics / concierge were failing INSERT when `stage` was a narrow ENUM.
+            try {
+                await addColumnIfMissing(
+                    'order_flow_logs',
+                    'started_at',
+                    'TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP',
+                    'order_id'
+                );
+            } catch (e) {
+                console.log('  🕒 order_flow_logs.started_at column:', e.message);
+            }
+            try {
+                await db.query(
+                    'ALTER TABLE order_flow_logs MODIFY COLUMN stage VARCHAR(64) NULL'
+                );
+                console.log('  ✅ order_flow_logs.stage widened to VARCHAR(64)');
+            } catch (e) {
+                console.log('  🕒 order_flow_logs.stage alter:', e.message);
+            }
+            try {
+                await db.query(
+                    'ALTER TABLE order_flow_logs MODIFY COLUMN status VARCHAR(64) NULL'
+                );
+                console.log('  ✅ order_flow_logs.status widened to VARCHAR(64)');
+            } catch (e) {
+                console.log('  🕒 order_flow_logs.status alter:', e.message);
+            }
+            try {
+                await db.query(
+                    'ALTER TABLE order_flow_logs MODIFY COLUMN started_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP'
+                );
+            } catch (e) {
+                console.log('  🕒 order_flow_logs.started_at default:', e.message);
+            }
+        }
     }
 ];
 

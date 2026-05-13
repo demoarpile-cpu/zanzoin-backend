@@ -3,19 +3,37 @@ const { companyFilter, companyScope } = require('../middleware/company');
 const { successResponse, errorResponse } = require('../utils/helpers');
 const { createNotification } = require('./notificationController');
 
-const VALID_ORDER_STATUSES = ['created', 'admin_review', 'operation', 'procurement', 'inventory', 'logistics', 'completed', 'cancelled'];
+const VALID_ORDER_STATUSES = [
+    'created',
+    'admin_review',
+    'concierge',
+    'operation',
+    'procurement',
+    'inventory',
+    'logistics',
+    'completed',
+    'cancelled',
+    'in_progress',
+    'delivered'
+];
 
 /** Admin may mutate orders for their tenant OR HQ (personal marketplace checkout). */
 function orderMutationScope(req) {
     const roleNorm = String(req.user.role || '').toLowerCase().replace(/\s+/g, '');
     if (roleNorm === 'super_admin' || roleNorm === 'superadmin') return { clause: '', params: [] };
-    
+
     const hqId = parseInt(process.env.DEFAULT_COMPANY_ID || 1, 10);
     const isHQUser = (req.user.company_id == hqId || !req.user.company_id || req.companyScope == hqId);
 
-    // Treat HQ staff (Admin, Operations, Logistics) as platform-level managers who can see everything
-    if (isHQUser && ['admin', 'operation', 'operations', 'logistics', 'procurement', 'inventory'].includes(roleNorm)) {
-        return { clause: '', params: [] };
+    // Treat HQ staff (Operations, Logistics, etc.) as platform-level managers for their specific stages.
+    // HQ Admins should be able to mutate all platform/marketplace orders (company 1) as well as any they specifically created.
+    if (isHQUser) {
+        if (roleNorm === 'admin' || roleNorm === 'manager') {
+            return { clause: ' AND (company_id = 1 OR company_id IS NULL OR created_by = ?)', params: [req.user.id] };
+        }
+        if (['operation', 'operations', 'logistics', 'procurement', 'inventory', 'concierge'].includes(roleNorm)) {
+            return { clause: '', params: [] }; // Ops / logistics / concierge see HQ fulfilment queues
+        }
     }
 
     if (!req.companyScope) return { clause: '', params: [] };
@@ -60,6 +78,31 @@ function normalizePositiveInt(val) {
     const n = Number(val);
     if (!Number.isFinite(n) || Number.isNaN(n) || n <= 0) return null;
     return Math.trunc(n);
+}
+
+/** MySQL DATE columns reject JS Date stringification; coerce Date / ISO / `YYYY-MM-DD` → `YYYY-MM-DD`. */
+function toMysqlDateOnly(val) {
+    if (val == null || val === '') {
+        return new Date().toISOString().slice(0, 10);
+    }
+    if (val instanceof Date && !Number.isNaN(val.getTime())) {
+        const y = val.getFullYear();
+        const m = String(val.getMonth() + 1).padStart(2, '0');
+        const d = String(val.getDate()).padStart(2, '0');
+        return `${y}-${m}-${d}`;
+    }
+    const s = String(val).trim();
+    if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+        return s.slice(0, 10);
+    }
+    const parsed = new Date(s);
+    if (!Number.isNaN(parsed.getTime())) {
+        const y = parsed.getFullYear();
+        const m = String(parsed.getMonth() + 1).padStart(2, '0');
+        const d = String(parsed.getDate()).padStart(2, '0');
+        return `${y}-${m}-${d}`;
+    }
+    return new Date().toISOString().slice(0, 10);
 }
 
 async function resolveReadableCompanyScope(req) {
@@ -154,8 +197,12 @@ exports.getAll = async (req, res) => {
         // Super admin sees everything (no tenant filter)
         // Super admin or HQ Admin sees everything (no tenant filter)
         const isHQ = (req.user.company_id == 1 || !req.user.company_id || req.companyScope == 1);
-        if (role === 'super_admin' || (role === 'admin' && isHQ)) {
+        if (role === 'super_admin') {
             // no additional filter
+        } else if (role === 'admin' && isHQ) {
+            // HQ Admin should see all marketplace/platform orders (company 1) plus any they specifically created
+            whereClause += ' AND (o.company_id = 1 OR o.company_id IS NULL OR o.created_by = ?)';
+            params.push(req.user.id);
         }
         // Customer sees only their own orders (by email or created_by)
         else if (role === 'customer') {
@@ -169,12 +216,11 @@ exports.getAll = async (req, res) => {
             if (role === 'admin') {
                 whereClause += ' AND (o.company_id = ? OR o.company_id = ?)';
                 params.push(effectiveCompanyScope, hqId);
-            } else if (role === 'operation' || role === 'logistics') {
-                // Marketplace / personal checkout is stored on HQ (DEFAULT_COMPANY_ID). Tenant operations &
-                // logistics users must still see that fulfilment queue; otherwise lists look "empty" while
-                // notifications say a new order exists.
+            } else if (role === 'operation' || role === 'logistics' || role === 'concierge') {
+                // Marketplace / personal checkout is stored on HQ (DEFAULT_COMPANY_ID). Tenant operations,
+                // logistics, and concierge users must still see HQ fulfilment / triage rows.
                 whereClause +=
-                    ' AND (o.company_id = ? OR (o.company_id = ? AND (o.current_stage IN (\'operation\',\'logistics\') OR o.status IN (\'operation\',\'logistics\'))))';
+                    ' AND (o.company_id = ? OR (o.company_id = ? AND (o.current_stage IN (\'operation\',\'logistics\',\'concierge\') OR o.status IN (\'operation\',\'logistics\',\'concierge\'))))';
                 params.push(effectiveCompanyScope, hqId);
             } else {
                 whereClause += ' AND o.company_id = ?';
@@ -183,13 +229,18 @@ exports.getAll = async (req, res) => {
 
             // Operational staff sees only orders assigned to them or at their stage
             // Role must match DB ENUM spelling (singular "operation").
-            const stageRoles = ['operation', 'procurement', 'inventory', 'logistics'];
+            const stageRoles = ['operation', 'procurement', 'inventory', 'logistics', 'concierge'];
             if (stageRoles.includes(role)) {
                 // Marketplace checkout lands in logistics; ops staff often use role "operation" — include logistics queue so orders are visible.
                 if (role === 'operation') {
                     whereClause +=
                         ' AND (o.assigned_to = ? OR (o.current_stage IN (\'operation\',\'logistics\') OR o.status IN (\'operation\',\'logistics\')))';
                     params.push(req.user.id);
+                } else if (role === 'logistics') {
+                    // All logistics users in the tenant see the full dispatch queue (unassigned + any assignee).
+                    whereClause += ' AND (o.current_stage = \'logistics\' OR o.status = \'logistics\')';
+                } else if (role === 'concierge') {
+                    whereClause += ' AND (o.current_stage = \'concierge\' OR o.status = \'concierge\')';
                 } else {
                     whereClause += ' AND (o.assigned_to = ? OR o.current_stage = ? OR o.status = ?)';
                     params.push(req.user.id, role, role);
@@ -277,10 +328,12 @@ exports.create = async (req, res) => {
             delivery_mode,
             book_chauffeur,
             custom_request_category,
-            concierge_member
+            concierge_member,
+            delivery_instructions
         } = req.body;
         const hqCompanyId = normalizePositiveInt(process.env.DEFAULT_COMPANY_ID || 1);
         const roleNorm = String(req.user?.role || '').toLowerCase().trim().replace(/\s+/g, '_');
+        const isCustomerRole = roleNorm === 'customer';
         const rawRequestedCompanyId = normalizePositiveInt(req.body.company_id || req.body.companyId);
         const scopedCompanyId = normalizePositiveInt(req.companyScope);
         // Tenant users should create orders inside their own workspace by default.
@@ -292,7 +345,7 @@ exports.create = async (req, res) => {
         let companyId = requestedCompanyId || scopedCompanyId || hqCompanyId;
 
         // Personal (customer) checkout always lands on HQ company — ignores mistaken client company_id so admin + logistics queues stay consistent.
-        if (req.user.role === 'customer') {
+        if (isCustomerRole) {
             companyId = await resolveValidCompanyId({
                 requestedCompanyId: hqCompanyId,
                 scopedCompanyId,
@@ -342,8 +395,7 @@ exports.create = async (req, res) => {
             dueDateVal = /^\d{4}-\d{2}-\d{2}$/.test(dd) ? dd : null;
         }
 
-        // Customer orders routing: marketplace → logistics (delivery team); custom_request → admin_review
-        const isCustomerRole = req.user.role === 'customer';
+        // Customer orders: marketplace + bespoke start in admin queue by default. Admin approves, then may assign to ops / logistics / driver — never skip straight to logistics on create (UI maps logistics → "Out for Delivery").
         const kindRaw = String(order_kind || '').toLowerCase().trim();
         const typeNorm = String(type || '').toLowerCase();
         const isCustomRequest =
@@ -359,9 +411,16 @@ exports.create = async (req, res) => {
                 initialStatus = 'admin_review';
                 initialStage = 'admin_review';
             } else {
-                // Normal marketplace checkout → delivery / logistics queue
-                initialStatus = 'logistics';
-                initialStage = 'logistics';
+                // Marketplace checkout → admin queue first (same as frontend payload); delivery row created when admin moves order to logistics.
+                const fromBody = normalizeOrderStatus(req.body.status);
+                const allowedFirst = ['admin_review', 'created'];
+                if (fromBody && allowedFirst.includes(fromBody)) {
+                    initialStatus = fromBody;
+                    initialStage = fromBody;
+                } else {
+                    initialStatus = 'admin_review';
+                    initialStage = 'admin_review';
+                }
             }
         } else {
             initialStatus = 'created';
@@ -370,6 +429,10 @@ exports.create = async (req, res) => {
 
         // delivery_address: accept from body or fall back to location field
         const finalDeliveryAddress = delivery_address || location || null;
+        const deliveryInstructionsVal =
+            delivery_instructions != null && String(delivery_instructions).trim() !== ''
+                ? String(delivery_instructions).trim()
+                : null;
 
         companyId = await resolveValidCompanyId({
             requestedCompanyId,
@@ -387,7 +450,7 @@ exports.create = async (req, res) => {
                 : null;
         if (Number.isNaN(resolvedCustomerId)) resolvedCustomerId = null;
 
-        if (req.user.role === 'customer') {
+        if (isCustomerRole) {
             resolvedCustomerId = null;
             const em = (req.user.email || '').trim().toLowerCase();
             if (em) {
@@ -419,11 +482,12 @@ exports.create = async (req, res) => {
         const [result] = await db.query(
             `INSERT INTO orders
              (company_id, customer_id, vendor_id, created_by, type, items, notes,
-              location, total_amount, status, current_stage, order_date, due_date)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              delivery_instructions, location, total_amount, status, current_stage, order_date, due_date)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 companyId, resolvedCustomerId, resolvedVendorId, req.user.id,
                 type || 'Custom Order', JSON.stringify(parsedItems), notesMerged,
+                deliveryInstructionsVal,
                 finalDeliveryAddress,
                 totalAmount, initialStatus, initialStage,
                 orderDateVal || new Date().toISOString().slice(0, 10),
@@ -442,10 +506,10 @@ exports.create = async (req, res) => {
             );
         }
 
-        // Create first flow log
+        // Create first flow log (stage matches initial workflow position)
         await db.query(
-            `INSERT INTO order_flow_logs (order_id, stage, assigned_by, status) VALUES (?, 'created', ?, 'completed')`,
-            [orderId, req.user.id]
+            `INSERT INTO order_flow_logs (order_id, stage, assigned_by, status) VALUES (?, ?, ?, 'completed')`,
+            [orderId, initialStage, req.user.id]
         );
 
         // Notify admin about new order
@@ -466,13 +530,20 @@ exports.create = async (req, res) => {
             link: '/dashboard/orders'
         });
 
+        // Delivery mission: only when order is already in logistics (staff flows). Marketplace customer orders stay admin_review until admin assigns logistics.
         if (initialStage === 'logistics') {
+            await db.query(
+                `INSERT INTO deliveries (company_id, order_id, mission_type, status, pickup_location, drop_location, package_details, delivery_date) 
+                 VALUES (?, ?, 'Delivery', 'pending', 'Warehouse / HQ', ?, ?, ?)`,
+                [companyId, orderId, finalDeliveryAddress || 'Customer Address', JSON.stringify(parsedItems), toMysqlDateOnly(orderDateVal)]
+            );
+
             await createNotification({
                 companyId: companyId,
                 roleTarget: 'logistics',
                 type: 'order',
                 title: `New Marketplace Order #${orderId}`,
-                message: `Delivery assignment queue — total $${totalAmount}`,
+                message: `Delivery mission automatically created — total $${totalAmount}`,
                 link: '/dashboard/deliveries'
             });
         }
@@ -492,7 +563,20 @@ exports.create = async (req, res) => {
 // PUT /api/orders/:id
 exports.update = async (req, res) => {
     try {
-        const allowedFields = ['customer_id', 'vendor_id', 'type', 'items', 'notes', 'location', 'total_amount', 'due_date', 'order_date', 'client_id', 'company_id'];
+        const allowedFields = [
+            'customer_id',
+            'vendor_id',
+            'type',
+            'items',
+            'notes',
+            'location',
+            'delivery_instructions',
+            'total_amount',
+            'due_date',
+            'order_date',
+            'client_id',
+            'company_id'
+        ];
         const fkFields = ['customer_id', 'vendor_id', 'client_id', 'company_id'];
         const sets = [];
         const values = [];
@@ -576,7 +660,7 @@ exports.assignToStage = async (req, res) => {
         const { id } = req.params;
         const { stage, assigned_to, notes } = req.body;
 
-        const validStages = ['admin_review', 'operation', 'procurement', 'inventory', 'logistics', 'completed'];
+        const validStages = ['admin_review', 'concierge', 'operation', 'procurement', 'inventory', 'logistics', 'completed'];
         if (!validStages.includes(stage)) {
             return errorResponse(res, `Invalid stage. Valid: ${validStages.join(', ')}`, 400);
         }
@@ -597,31 +681,125 @@ exports.assignToStage = async (req, res) => {
 
         // Update order
         const newStatus = stage === 'completed' ? 'completed' : stage;
+        const assigneeId =
+            assigned_to === undefined || assigned_to === null || assigned_to === '' ? null : assigned_to;
+
         await db.query(
             `UPDATE orders SET status = ?, current_stage = ?, assigned_to = ? WHERE id = ?`,
-            [newStatus, stage, assigned_to || null, id]
+            [newStatus, stage, assigneeId, id]
         );
 
-        // Create new flow log
-        await db.query(
-            `INSERT INTO order_flow_logs (order_id, stage, assigned_to, assigned_by, status, notes) VALUES (?, ?, ?, ?, ?, ?)`,
-            [id, stage, assigned_to || null, req.user.id, stage === 'completed' ? 'completed' : 'pending', notes || null]
-        );
+        // Create new flow log (started_at avoids strict-mode default errors when column exists)
+        try {
+            await db.query(
+                `INSERT INTO order_flow_logs (order_id, stage, assigned_to, assigned_by, status, notes, started_at) VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+                [id, stage, assigneeId, req.user.id, stage === 'completed' ? 'completed' : 'pending', notes || null]
+            );
+        } catch (flErr) {
+            if (flErr.code === 'ER_BAD_FIELD_ERROR') {
+                await db.query(
+                    `INSERT INTO order_flow_logs (order_id, stage, assigned_to, assigned_by, status, notes) VALUES (?, ?, ?, ?, ?, ?)`,
+                    [id, stage, assigneeId, req.user.id, stage === 'completed' ? 'completed' : 'pending', notes || null]
+                );
+            } else {
+                throw flErr;
+            }
+        }
 
         // Notify the target role about stage transition
+        const notifyRole =
+            stage === 'completed' ? 'admin' : stage === 'concierge' ? 'concierge' : stage === 'logistics' ? 'logistics' : stage;
         await createNotification({
             companyId: order.company_id,
-            roleTarget: stage === 'completed' ? 'admin' : stage,
+            roleTarget: notifyRole,
             type: 'order',
             title: `Order #${id} — ${stage.charAt(0).toUpperCase() + stage.slice(1)}`,
             message: `Order #${id} has been moved to ${stage} stage by ${req.user.name || 'Admin'}`,
             link: '/dashboard/orders'
         });
 
+        // Marketplace path: when admin sends order to logistics, ensure a delivery mission exists so the whole logistics team sees it on Deliveries.
+        if (stage === 'logistics') {
+            const [existingDel] = await db.query('SELECT id FROM deliveries WHERE order_id = ? LIMIT 1', [id]);
+            if (!existingDel.length) {
+                let parsedItems = [];
+                try {
+                    parsedItems = typeof order.items === 'string' ? JSON.parse(order.items) : (order.items || []);
+                    if (!Array.isArray(parsedItems)) parsedItems = [];
+                } catch {
+                    parsedItems = [];
+                }
+                const dropAddr = order.delivery_address || order.location || 'Customer Address';
+                const orderDay = toMysqlDateOnly(order.order_date);
+                const instr = order.delivery_instructions || null;
+                const fee = parseFloat(order.total_amount) || 0;
+                try {
+                    await db.query(
+                        `INSERT INTO deliveries (company_id, order_id, mission_type, status, pickup_location, drop_location, package_details, delivery_date, delivery_instructions, delivery_fee)
+                         VALUES (?, ?, 'Delivery', 'pending', 'Warehouse / HQ', ?, ?, ?, ?, ?)`,
+                        [
+                            order.company_id,
+                            id,
+                            dropAddr,
+                            JSON.stringify(parsedItems),
+                            orderDay,
+                            instr,
+                            fee
+                        ]
+                    );
+                } catch (insErr) {
+                    // Duplicate row (race with client) — treat as success
+                    if (insErr.code === 'ER_DUP_ENTRY') {
+                        /* delivery already linked to this order */
+                    } else if (insErr.code === 'ER_BAD_FIELD_ERROR') {
+                        await db.query(
+                            `INSERT INTO deliveries (company_id, order_id, mission_type, status, pickup_location, drop_location, package_details, delivery_date)
+                             VALUES (?, ?, 'Delivery', 'pending', 'Warehouse / HQ', ?, ?, ?)`,
+                            [order.company_id, id, dropAddr, JSON.stringify(parsedItems), orderDay]
+                        );
+                    } else if (
+                        insErr.code === 'WARN_DATA_TRUNCATED' ||
+                        insErr.errno === 1265 ||
+                        (insErr.sqlMessage && String(insErr.sqlMessage).includes('Incorrect'))
+                    ) {
+                        // Some DBs use title-cased status ENUM (e.g. Pending) — retry common variants
+                        await db.query(
+                            `INSERT INTO deliveries (company_id, order_id, mission_type, status, pickup_location, drop_location, package_details, delivery_date, delivery_instructions, delivery_fee)
+                             VALUES (?, ?, 'Delivery', 'Pending', 'Warehouse / HQ', ?, ?, ?, ?, ?)`,
+                            [
+                                order.company_id,
+                                id,
+                                dropAddr,
+                                JSON.stringify(parsedItems),
+                                orderDay,
+                                instr,
+                                fee
+                            ]
+                        );
+                    } else {
+                        throw insErr;
+                    }
+                }
+                await createNotification({
+                    companyId: order.company_id,
+                    roleTarget: 'logistics',
+                    type: 'order',
+                    title: `Dispatch queue: Order #${id}`,
+                    message: `Order #${id} approved — assign a driver in Deliveries.`,
+                    link: '/dashboard/deliveries'
+                });
+            }
+        }
+
         return successResponse(res, { id, stage, assigned_to }, `Order assigned to ${stage} stage.`);
     } catch (err) {
         console.error('Assign stage error:', err);
-        return errorResponse(res, 'Failed to assign order.', 500);
+        const hint = err.sqlMessage || err.message || '';
+        const msg =
+            process.env.NODE_ENV === 'production'
+                ? 'Failed to assign order.'
+                : `Failed to assign order. ${hint}`.trim();
+        return errorResponse(res, msg, 500);
     }
 };
 
@@ -738,10 +916,12 @@ exports.getAllProjects = async (req, res) => {
     try {
         const role = req.user.role;
         const isHQ = (req.user.company_id == 1 || !req.user.company_id || req.companyScope == 1);
-        
+
         let cf;
-        if (role === 'super_admin' || (role === 'admin' && isHQ)) {
+        if (role === 'super_admin') {
             cf = { clause: '', params: [] };
+        } else if (role === 'admin' && isHQ) {
+            cf = { clause: ' AND p.manager_id = ?', params: [req.user.id] }; // or created_by if projects had it
         } else {
             cf = companyFilter(req, 'p');
         }
@@ -872,7 +1052,7 @@ exports.updateProject = async (req, res) => {
         const { name, description, status, location, start_date, manager_id } = req.body;
         const role = req.user.role;
         const isHQ = (req.user.company_id == 1 || !req.user.company_id || req.companyScope == 1);
-        
+
         let cs;
         if (role === 'super_admin' || (role === 'admin' && isHQ)) {
             cs = { clause: '', params: [] };
@@ -895,7 +1075,7 @@ exports.deleteProject = async (req, res) => {
     try {
         const role = req.user.role;
         const isHQ = (req.user.company_id == 1 || !req.user.company_id || req.companyScope == 1);
-        
+
         let cs;
         if (role === 'super_admin' || (role === 'admin' && isHQ)) {
             cs = { clause: '', params: [] };

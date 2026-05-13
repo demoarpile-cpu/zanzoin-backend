@@ -48,14 +48,20 @@ exports.createTicket = async (req, res) => {
 
 exports.updateTicketStatus = async (req, res) => {
     try {
-        const { status, messages } = req.body;
+        const { status, messages, dispute_status, refund_amount } = req.body;
+        const sets = [];
+        const values = [];
+
+        if (status) { sets.push('status = ?'); values.push(status); }
+        if (messages) { sets.push('messages = ?'); values.push(JSON.stringify(messages)); }
+        if (dispute_status) { sets.push('dispute_status = ?'); values.push(dispute_status); }
+        if (refund_amount !== undefined) { sets.push('refund_amount = ?'); values.push(refund_amount); }
+
+        if (sets.length === 0) return errorResponse(res, 'No fields to update.', 400);
+
         const cs = companyScope(req);
-        
-        if (messages) {
-            await db.query(`UPDATE support_tickets SET status = COALESCE(?, status), messages = ? WHERE id = ?${cs.clause}`, [status, JSON.stringify(messages), req.params.id, ...cs.params]);
-        } else {
-            await db.query(`UPDATE support_tickets SET status = ? WHERE id = ?${cs.clause}`, [status, req.params.id, ...cs.params]);
-        }
+        values.push(req.params.id, ...cs.params);
+        await db.query(`UPDATE support_tickets SET ${sets.join(', ')} WHERE id = ?${cs.clause}`, values);
         
         return successResponse(res, { id: req.params.id, status }, 'Ticket updated.');
     } catch (err) { 

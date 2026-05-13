@@ -10,7 +10,8 @@ function clampPercentMetric(val) {
     return Math.min(100, Math.max(0, n));
 }
 
-function isSuperAdminRole(role) {
+function isSuperAdminRole(userOrRole) {
+    const role = typeof userOrRole === 'object' ? userOrRole.role : userOrRole;
     const r = String(role || '').trim().toLowerCase().replace(/\s+/g, '_');
     return r === 'super_admin' || r === 'superadmin';
 }
@@ -51,6 +52,17 @@ exports.getAll = async (req, res) => {
 
         if (!companyId) return successResponse(res, []);
 
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+
+        if (roleNorm === 'admin' && isHQ) {
+            const [rows] = await db.query(
+                `SELECT *, location AS address FROM vendors WHERE (company_id = ? OR company_id IS NULL) AND created_by = ? ORDER BY created_at DESC`,
+                [companyId || 1, req.user.id]
+            );
+            return successResponse(res, rows);
+        }
+
         const [rows] = await db.query(
             `SELECT *, location AS address FROM vendors WHERE company_id = ? ORDER BY created_at DESC`,
             [companyId]
@@ -85,29 +97,31 @@ exports.create = async (req, res) => {
         }
 
         let [companyRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [companyId]);
-        if (!companyRows.length && scopedCompanyId) {
-            const [scopedRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [scopedCompanyId]);
-            if (scopedRows.length) {
-                companyId = scopedCompanyId;
-                companyRows = scopedRows;
+        
+        // --- EMERGENCY HEALING: If no companies exist and user is platform admin, create HQ company ---
+        const roleNorm = String(req.user?.role || '').toLowerCase().trim().replace(/\s+/g, '_');
+        const isPlatformAdmin = roleNorm === 'super_admin' || roleNorm === 'admin';
+
+        if (!companyRows.length && isPlatformAdmin) {
+            const [allCompanies] = await db.query('SELECT id FROM companies LIMIT 1');
+            if (allCompanies.length === 0) {
+                console.log("Emergency: No companies found in Vendor Create. Creating HQ Company.");
+                const [hqResult] = await db.query(
+                    `INSERT INTO companies (id, name, email, plan, status) VALUES (1, 'ZaneZion HQ', 'hq@zanezion.com', 'Enterprise', 'active')`
+                );
+                companyId = hqResult.insertId || 1;
+                companyRows = [{ id: companyId }];
+            } else {
+                const [anyCompany] = await db.query('SELECT id FROM companies ORDER BY id ASC LIMIT 1');
+                if (anyCompany.length) {
+                    companyId = anyCompany[0].id;
+                    companyRows = anyCompany;
+                }
             }
         }
-        if (!companyRows.length && fallbackCompanyId) {
-            const [fallbackRows] = await db.query('SELECT id FROM companies WHERE id = ? LIMIT 1', [fallbackCompanyId]);
-            if (fallbackRows.length) {
-                companyId = fallbackCompanyId;
-                companyRows = fallbackRows;
-            }
-        }
+
         if (!companyRows.length) {
-            const [anyCompany] = await db.query('SELECT id FROM companies ORDER BY id ASC LIMIT 1');
-            if (anyCompany.length) {
-                companyId = anyCompany[0].id;
-                companyRows = anyCompany;
-            }
-        }
-        if (!companyRows.length) {
-            return errorResponse(res, 'Invalid company_id. Company not found.', 400);
+            return errorResponse(res, 'Invalid company_id. Company not found. Please create a company first.', 400);
         }
 
         const ratingVal = clampPercentMetric(rating);
@@ -117,8 +131,8 @@ exports.create = async (req, res) => {
         const safeStatus = 'inactive';
 
         const [result] = await db.query(
-            `INSERT INTO vendors (company_id, name, email, phone, contact_name, category, location, rating, delivery, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO vendors (company_id, name, email, phone, contact_name, category, location, rating, delivery, status, created_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 companyId,
                 String(name).trim(),
@@ -129,7 +143,8 @@ exports.create = async (req, res) => {
                 location,
                 ratingVal,
                 deliveryVal,
-                safeStatus
+                safeStatus,
+                req.user.id
             ]
         );
         return successResponse(res, { id: result.insertId, name: String(name).trim(), status: safeStatus }, 'Vendor created.', 201);
@@ -186,8 +201,10 @@ exports.update = async (req, res) => {
         const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
         
         let cs;
-        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+        if (isSuperAdmin) {
             cs = { clause: '', params: [] };
+        } else if (isHQ) {
+            cs = { clause: ' AND created_by = ?', params: [req.user.id] };
         } else {
             cs = companyScope(req);
         }
@@ -209,7 +226,7 @@ exports.remove = async (req, res) => {
         const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
         
         let cs;
-        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+        if (isSuperAdmin) {
             cs = { clause: '', params: [] };
         } else {
             cs = companyScope(req);

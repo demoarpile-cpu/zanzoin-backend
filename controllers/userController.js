@@ -21,10 +21,17 @@ exports.getCustomers = async (req, res) => {
             query += ` AND LOWER(COALESCE(status, 'active')) = 'active'`;
         }
 
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+
         if (companyId) {
-            // Also include customers with no company (personal signups via website)
-            query += ' AND (company_id = ? OR company_id IS NULL)';
-            params.push(companyId);
+            if (roleNorm === 'admin' && isHQ) {
+                query += ' AND (company_id = ? OR company_id IS NULL) AND (created_by = ? OR created_by IS NULL)';
+                params.push(companyId, req.user.id);
+            } else {
+                query += ' AND (company_id = ? OR company_id IS NULL)';
+                params.push(companyId);
+            }
         }
         query += ' ORDER BY name ASC';
 
@@ -42,10 +49,12 @@ exports.getAll = async (req, res) => {
         const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm.replace(/\s+/g, '')) || ['super_admin', 'superadmin'].includes(roleNorm);
         const isHQ = (req.user.company_id == 1 || !req.user.company_id || req.companyScope == 1);
 
-        // HQ admins and super admins see ALL users (global view)
+        // HQ admins see only their own created users, Super Admins see ALL
         let cf;
-        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+        if (isSuperAdmin) {
             cf = { clause: '', params: [] };
+        } else if ((roleNorm === 'admin' || roleNorm === 'manager') && isHQ) {
+            cf = { clause: ' AND (u.created_by = ? OR u.id = ?)', params: [req.user.id, req.user.id] };
         } else {
             cf = companyFilter(req);
         }
@@ -82,7 +91,19 @@ exports.getAll = async (req, res) => {
 // GET /api/users/:id
 exports.getById = async (req, res) => {
     try {
-        const cs = companyScope(req, 'u');
+        const roleNorm = String(req.user?.role || '').toLowerCase().replace(/\s+/g, '_');
+        const isSuperAdmin = ['super_admin', 'superadmin'].includes(roleNorm);
+        const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
+
+        let cs;
+        if (isSuperAdmin) {
+            cs = { clause: '', params: [] };
+        } else if (isHQ) {
+            cs = { clause: ' AND (u.created_by = ? OR u.id = ?)', params: [req.user.id, req.user.id] };
+        } else {
+            cs = companyScope(req, 'u');
+        }
+
         const [rows] = await db.query(
             `SELECT u.*, c.name as company_name FROM users u LEFT JOIN companies c ON u.company_id = c.id WHERE u.id = ?${cs.clause}`,
             [req.params.id, ...cs.params]
@@ -158,12 +179,12 @@ exports.create = async (req, res) => {
 
         const [result] = await db.query(
             `INSERT INTO users
-             (name, email, password, phone, role, company_id, employment_status, status,
+             (name, email, password, phone, role, company_id, created_by, employment_status, status,
               birthday, bank_name, account_number, routing_number, nib_number, vacation_balance)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 name, email, hashedPassword, phone || null,
-                targetRole, assignedCompany,
+                targetRole, assignedCompany, req.user.id,
                 employment_status || 'Full Time', status || 'active',
                 birthday, bank_name, account_number, routing_number, nib_number, vacation_balance
             ]
@@ -246,10 +267,12 @@ exports.update = async (req, res) => {
         const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
         
         let cs;
-        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+        if (isSuperAdmin) {
             cs = { clause: '', params: [] };
+        } else if (isHQ) {
+            cs = { clause: ' AND (u.created_by = ? OR u.id = ?)', params: [req.user.id, req.user.id] };
         } else {
-            cs = companyScope(req);
+            cs = companyScope(req, 'u');
         }
 
         values.push(req.params.id, ...cs.params);
@@ -280,10 +303,12 @@ exports.remove = async (req, res) => {
         const isHQ = (req.user?.company_id == 1 || !req.user?.company_id || req.companyScope == 1);
         
         let cs;
-        if (isSuperAdmin || (roleNorm === 'admin' && isHQ)) {
+        if (isSuperAdmin) {
             cs = { clause: '', params: [] };
+        } else if (isHQ) {
+            cs = { clause: ' AND (u.created_by = ? OR u.id = ?)', params: [req.user.id, req.user.id] };
         } else {
-            cs = companyScope(req);
+            cs = companyScope(req, 'u');
         }
 
         await db.query(`DELETE FROM users WHERE id = ?${cs.clause}`, [req.params.id, ...cs.params]);
